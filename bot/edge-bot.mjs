@@ -546,6 +546,121 @@ const server = createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found. Use /state, /run, or /log" }));
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TELEGRAM COMMAND LISTENER — /trades, /status, /run
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+
+function buildPolymarketLink(game, teamA, teamB) {
+  // Best-effort Polymarket link — search page
+  const slug = game === "csgo" ? "cs2" : game;
+  return `https://polymarket.com/esports/${slug}/games`;
+}
+
+async function handleTelegramCommand(text) {
+  const state = loadState();
+  if (!state) return "Bot hasn't run yet. No state available.";
+
+  const cmd = text.trim().toLowerCase();
+
+  if (cmd === "/trades" || cmd === "/positions") {
+    const open = state.openPositions || [];
+    if (open.length === 0) return "📭 No open trades right now.";
+
+    let msg = `📊 <b>OPEN TRADES (${open.length})</b>\n`;
+    const deployed = open.reduce((s, p) => s + p.betSize, 0);
+    msg += `💰 $${deployed.toFixed(0)} deployed of $${state.bankroll.toFixed(0)} bankroll\n\n`;
+
+    open.forEach((p, i) => {
+      const game = GAME_LABEL[p.game] || p.game;
+      const matchDate = new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
+      const link = buildPolymarketLink(p.game, p.teamA, p.teamB);
+      msg += `${i + 1}. <b>${game}</b> — ${p.event}\n`;
+      msg += `   Pick: <b>${p.pick}</b> | Edge: +${p.edge}% | $${p.betSize}\n`;
+      msg += `   Model: ${p.ourProb}% vs Market: ${p.marketProb}%\n`;
+      msg += `   ${p.league} · BO${p.format} · ${matchDate} UTC\n`;
+      msg += `   🔗 <a href="${link}">Polymarket</a>\n\n`;
+    });
+
+    return msg;
+  }
+
+  if (cmd === "/status" || cmd === "/stats") {
+    const pnl = state.bankroll - (state.initialBankroll || 1000);
+    const closed = state.closedPositions || [];
+    const open = state.openPositions || [];
+    const wins = closed.filter(p => p.result === "win").length;
+    const losses = closed.filter(p => p.result === "loss").length;
+    const total = wins + losses;
+    const hitRate = total > 0 ? (wins / total * 100).toFixed(1) : "0.0";
+    const deployed = open.reduce((s, p) => s + p.betSize, 0);
+    const totalPnl = closed.reduce((s, p) => s + (p.pnl || 0), 0);
+    const avgEdge = closed.length > 0 ? (closed.reduce((s, p) => s + (p.edge || 0), 0) / closed.length).toFixed(1) : "0.0";
+
+    const w = state.modelWeights || {};
+
+    let msg = `📈 <b>BOT STATUS</b>\n\n`;
+    msg += `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n`;
+    msg += `💰 P&L: <b>${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</b> (${pnl >= 0 ? "+" : ""}${((pnl / (state.initialBankroll || 1000)) * 100).toFixed(1)}%)\n`;
+    msg += `📊 Deployed: $${deployed.toFixed(0)} (${(deployed / state.bankroll * 100).toFixed(0)}%)\n\n`;
+    msg += `🎯 <b>RECORD</b>\n`;
+    msg += `   ${wins}W - ${losses}L (${hitRate}% hit rate)\n`;
+    msg += `   Avg edge: ${avgEdge}%\n`;
+    msg += `   Closed P&L: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}\n\n`;
+    msg += `📋 Open: ${open.length}/${MAX_POSITIONS} | Closed: ${closed.length}\n`;
+    msg += `🧠 Weights: Form ${(w.form * 100 || 45).toFixed(0)}% · Overall ${(w.overall * 100 || 35).toFixed(0)}% · H2H ${(w.h2h * 100 || 15).toFixed(0)}%\n`;
+    msg += `🔄 Run #${state.totalRuns || 0}`;
+    if (state.lastRunAt) msg += ` · Last: ${new Date(state.lastRunAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" })} UTC`;
+
+    return msg;
+  }
+
+  if (cmd === "/run") {
+    await sendTG("⚡ Manual bot run starting...");
+    const result = await runBot();
+    return result.ok ? "✅ Bot run complete." : `❌ Bot run failed: ${result.error}`;
+  }
+
+  if (cmd === "/help") {
+    return `🤖 <b>Edge Terminal Bot</b>\n\n` +
+      `/trades — View open positions\n` +
+      `/status — Bankroll, P&L, win rate\n` +
+      `/run — Trigger a bot run now\n` +
+      `/help — This message`;
+  }
+
+  return null; // Not a recognized command
+}
+
+let tgOffset = 0;
+
+async function pollTelegram() {
+  if (!CFG.TELEGRAM_BOT_TOKEN || !CFG.TELEGRAM_CHAT_ID) return;
+
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${CFG.TELEGRAM_BOT_TOKEN}/getUpdates?offset=${tgOffset}&timeout=30`);
+    const data = await r.json();
+
+    if (data.ok && data.result?.length > 0) {
+      for (const update of data.result) {
+        tgOffset = update.update_id + 1;
+        const msg = update.message;
+        if (!msg || !msg.text) continue;
+        if (String(msg.chat.id) !== String(CFG.TELEGRAM_CHAT_ID)) continue;
+
+        const reply = await handleTelegramCommand(msg.text);
+        if (reply) await sendTG(reply);
+      }
+    }
+  } catch (e) {
+    console.error("TG poll error:", e.message);
+  }
+
+  // Poll again
+  setTimeout(pollTelegram, 1000);
+}
+
 // ─── Startup Mode ───────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
@@ -558,13 +673,17 @@ if (args.includes("--run")) {
     process.exit(result.ok ? 0 : 1);
   });
 } else {
-  // Server mode: start HTTP server + run bot immediately
+  // Server mode: start HTTP server + Telegram listener + run bot immediately
   server.listen(PORT, () => {
     console.log(`\n🚀 Edge Terminal Bot Server running on port ${PORT}`);
     console.log(`   State:   http://localhost:${PORT}/state?secret=${CFG.BOT_SECRET}`);
     console.log(`   Trigger: http://localhost:${PORT}/run?secret=${CFG.BOT_SECRET}`);
     console.log(`   Logs:    http://localhost:${PORT}/log?secret=${CFG.BOT_SECRET}\n`);
   });
+
+  // Start Telegram command listener
+  console.log("📱 Starting Telegram command listener...");
+  pollTelegram();
 
   // Run bot immediately on startup
   runBot().then(result => {
