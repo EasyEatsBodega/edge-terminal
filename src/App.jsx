@@ -38,6 +38,48 @@ async function fetchUpcoming(game, token) {
   return cachedPanda(`${game}/matches/upcoming?per_page=25&sort=scheduled_at`, token, 5 * 60 * 1000);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLYMARKET — Live Moneyline Odds
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const POLY_TAG = { csgo: 100780, dota2: 102366, lol: 65 };
+
+async function fetchPolymarketOdds() {
+  const results = await Promise.allSettled(
+    Object.entries(POLY_TAG).map(([, tagId]) =>
+      fetch(`https://gamma-api.polymarket.com/markets?sports_market_types=moneyline&closed=false&tag_id=${tagId}&limit=50`)
+        .then(r => r.ok ? r.json() : [])
+    )
+  );
+  return results.flatMap(r => r.status === "fulfilled" ? r.value : []);
+}
+
+function matchPolyOdds(polyMarkets, teamA, teamB) {
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const a = norm(teamA);
+  const b = norm(teamB);
+
+  for (const mkt of polyMarkets) {
+    const question = norm(mkt.question || "");
+    const outcomes = (mkt.outcomes || []).map(o => norm(o));
+    const allText = question + " " + outcomes.join(" ");
+    const hasA = allText.includes(a) || outcomes.some(o => o.includes(a) || a.includes(o));
+    const hasB = allText.includes(b) || outcomes.some(o => o.includes(b) || b.includes(o));
+
+    if (hasA && hasB && mkt.outcomePrices) {
+      const prices = typeof mkt.outcomePrices === "string" ? JSON.parse(mkt.outcomePrices) : mkt.outcomePrices;
+      if (prices.length >= 2) {
+        const o0 = norm(mkt.outcomes?.[0] || "");
+        const aIsFirst = o0.includes(a) || a.includes(o0);
+        const probFirst = parseFloat(prices[0]) * 100;
+        const probSecond = parseFloat(prices[1]) * 100;
+        return { probA: +(aIsFirst ? probFirst : probSecond).toFixed(1) };
+      }
+    }
+  }
+  return null;
+}
+
 async function fetchTeamHistory(game, teamId, token) {
   return cachedPanda(`${game}/matches/past?filter[opponent_id]=${teamId}&per_page=25&sort=-scheduled_at`, token, 15 * 60 * 1000);
 }
@@ -304,6 +346,23 @@ export default function App() {
 
       all.sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
       setUpcoming(all);
+
+      // Auto-fetch Polymarket odds
+      try {
+        const polyMarkets = await fetchPolymarketOdds();
+        if (polyMarkets.length > 0) {
+          const autoOdds = {};
+          all.forEach(m => {
+            if (marketOdds[m.id]) return; // Don't overwrite manual entries
+            const odds = matchPolyOdds(polyMarkets, m.teamA.name, m.teamB.name) ||
+                         matchPolyOdds(polyMarkets, m.teamA.acronym, m.teamB.acronym);
+            if (odds) autoOdds[m.id] = odds;
+          });
+          if (Object.keys(autoOdds).length > 0) {
+            setMarketOdds(prev => ({ ...autoOdds, ...prev }));
+          }
+        }
+      } catch (e) { console.error("Polymarket fetch failed:", e); }
 
       // Kick off predictions for all matches
       all.forEach(m => loadPrediction(m));
@@ -679,7 +738,7 @@ export default function App() {
 
                           {/* Market Odds Input */}
                           <div style={{ display: "flex", gap: 10, marginBottom: 16, alignItems: "center" }}>
-                            <span style={{ fontSize: 12, color: PAL.sub }}>Market price (Polymarket):</span>
+                            <span style={{ fontSize: 12, color: PAL.sub }}>Market odds{mkt ? "" : " (no match found)"}:</span>
                             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                               <span style={{ fontSize: 11, color: PAL.dim }}>{match.teamA.acronym}</span>
                               <input
@@ -912,34 +971,48 @@ export default function App() {
                 )}
               </div>
 
-              {/* Closed Positions */}
+              {/* Trade History */}
               <div>
-                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Recent Results ({botState.closedPositions?.length || 0})</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700 }}>Trade History ({botState.closedPositions?.length || 0})</div>
+                  {botState.closedPositions?.length > 0 && (
+                    <div style={{ fontSize: 11, color: PAL.dim }}>
+                      {(() => { const cl = botState.closedPositions || []; const totalPnl = cl.reduce((s, p) => s + (p.pnl || 0), 0); return `Total P&L: `; })()}
+                      <span style={{ fontWeight: 700, color: (botState.closedPositions || []).reduce((s, p) => s + (p.pnl || 0), 0) >= 0 ? PAL.green : PAL.red }}>
+                        {(botState.closedPositions || []).reduce((s, p) => s + (p.pnl || 0), 0) >= 0 ? "+" : ""}${(botState.closedPositions || []).reduce((s, p) => s + (p.pnl || 0), 0).toFixed(2)}
+                      </span>
+                    </div>
+                  )}
+                </div>
                 {(!botState.closedPositions || botState.closedPositions.length === 0) ? (
                   <div style={{ padding: 24, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
-                    No resolved bets yet.
+                    No resolved bets yet. The bot will auto-resolve when matches finish.
                   </div>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                    {botState.closedPositions.slice(0, 25).map(p => (
-                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 80px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 8, fontSize: 13 }}>
+                    {/* Header row */}
+                    <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 60px 60px 54px 54px 60px 80px", padding: "6px 14px", fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.05em" }}>
+                      <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>MARKET</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span style={{ textAlign: "right" }}>DATE</span>
+                    </div>
+                    {botState.closedPositions.map(p => (
+                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "46px 1fr 60px 60px 54px 54px 60px 80px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
                         <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
                         <div>
-                          <div style={{ fontWeight: 600 }}>{p.pick}</div>
-                          <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{" · "}{p.league}</div>
+                          <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+                            {p.pick}
+                            <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: p.result === "win" ? `${PAL.green}20` : `${PAL.red}20`, color: p.result === "win" ? PAL.green : PAL.red }}>{p.result?.toUpperCase()}</span>
+                          </div>
+                          <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{p.league ? ` · ${p.league}` : ""}{p.format > 1 ? ` · BO${p.format}` : ""}</div>
                         </div>
-                        <div style={{ textAlign: "center" }}>
-                          <div style={{ fontSize: 12, fontWeight: 700 }}>{p.ourProb}%</div>
-                          <div style={{ fontSize: 10, color: PAL.dim }}>model</div>
-                        </div>
-                        <div style={{ textAlign: "center", fontWeight: 700, color: p.result === "win" ? PAL.green : PAL.red }}>
-                          {p.result?.toUpperCase()}
-                        </div>
+                        <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600 }}>{p.ourProb}%</div>
+                        <div style={{ textAlign: "center", fontSize: 12, color: PAL.sub }}>{p.marketProb}%</div>
+                        <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600, color: PAL.green }}>+{p.edge}%</div>
+                        <div style={{ textAlign: "center", fontSize: 12 }}>${p.betSize}</div>
                         <div style={{ textAlign: "center", fontWeight: 700, color: (p.pnl || 0) >= 0 ? PAL.green : PAL.red }}>
                           {(p.pnl || 0) >= 0 ? "+" : ""}${(p.pnl || 0).toFixed(2)}
                         </div>
                         <div style={{ fontSize: 10, color: PAL.dim, textAlign: "right" }}>
-                          ${p.betSize} bet
+                          {p.resolvedAt ? new Date(p.resolvedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : p.placedAt ? new Date(p.placedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : ""}
                         </div>
                       </div>
                     ))}

@@ -60,28 +60,55 @@ async function pandaFetch(path) {
 
 // ─── Polymarket ──────────────────────────────────────────────────────────────
 
-async function fetchPolymarketEsports() {
+// Polymarket Gamma API — sports moneyline markets by game-specific tag_id
+const POLY_TAG = { csgo: 100780, dota2: 102366, lol: 65 };
+
+async function fetchPolymarketByGame(game) {
+  const tagId = POLY_TAG[game];
+  if (!tagId) return [];
   try {
-    const r = await fetch("https://gamma-api.polymarket.com/events?tag=esports&active=true&closed=false&limit=100");
+    const r = await fetch(`https://gamma-api.polymarket.com/markets?sports_market_types=moneyline&closed=false&tag_id=${tagId}&limit=50`);
     if (!r.ok) return [];
     return await r.json();
   } catch (e) { return []; }
 }
 
-function matchPolymarket(polyEvents, teamA, teamB) {
+async function fetchAllPolymarketEsports() {
+  const [csgo, dota2, lol] = await Promise.all([
+    fetchPolymarketByGame("csgo"),
+    fetchPolymarketByGame("dota2"),
+    fetchPolymarketByGame("lol"),
+  ]);
+  return [...csgo, ...dota2, ...lol];
+}
+
+function matchPolymarket(polyMarkets, teamA, teamB) {
   const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
   const a = norm(teamA);
   const b = norm(teamB);
 
-  for (const ev of polyEvents) {
-    const title = norm(ev.title || "");
-    const desc = norm(ev.description || "");
-    const combined = title + " " + desc;
-    if (combined.includes(a) && combined.includes(b)) {
-      const mkt = ev.markets?.[0];
-      if (mkt && mkt.outcomePrices) {
-        const prices = typeof mkt.outcomePrices === "string" ? JSON.parse(mkt.outcomePrices) : mkt.outcomePrices;
-        return { probA: parseFloat(prices[0]) * 100, probB: parseFloat(prices[1]) * 100 };
+  for (const mkt of polyMarkets) {
+    const question = norm(mkt.question || "");
+    const outcomes = (mkt.outcomes || []).map(o => norm(o));
+
+    // Check if both teams appear in the question or outcomes
+    const allText = question + " " + outcomes.join(" ");
+    const hasA = allText.includes(a) || outcomes.some(o => o.includes(a) || a.includes(o));
+    const hasB = allText.includes(b) || outcomes.some(o => o.includes(b) || b.includes(o));
+
+    if (hasA && hasB && mkt.outcomePrices) {
+      const prices = typeof mkt.outcomePrices === "string" ? JSON.parse(mkt.outcomePrices) : mkt.outcomePrices;
+      if (prices.length >= 2) {
+        // Figure out which outcome is which team
+        const o0 = norm(mkt.outcomes?.[0] || "");
+        const o1 = norm(mkt.outcomes?.[1] || "");
+        const aIsFirst = o0.includes(a) || a.includes(o0);
+        const probFirst = parseFloat(prices[0]) * 100;
+        const probSecond = parseFloat(prices[1]) * 100;
+        return {
+          probA: aIsFirst ? probFirst : probSecond,
+          probB: aIsFirst ? probSecond : probFirst,
+        };
       }
     }
   }
@@ -315,12 +342,12 @@ export default async function handler(req, res) {
     const canBet = state.openPositions.length < MAX_POSITIONS && deployedPct < MAX_DEPLOYED_PCT && state.bankroll > MIN_BET;
 
     if (canBet) {
-      // Fetch upcoming matches + Polymarket in parallel
-      const [csgo, dota2, lol, polyEvents] = await Promise.all([
+      // Fetch upcoming matches + Polymarket moneyline markets in parallel
+      const [csgo, dota2, lol, polyMarkets] = await Promise.all([
         pandaFetch("csgo/matches/upcoming?per_page=15&sort=scheduled_at").catch(() => []),
         pandaFetch("dota2/matches/upcoming?per_page=15&sort=scheduled_at").catch(() => []),
         pandaFetch("lol/matches/upcoming?per_page=15&sort=scheduled_at").catch(() => []),
-        fetchPolymarketEsports(),
+        fetchAllPolymarketEsports(),
       ]);
 
       const allMatches = [
@@ -329,7 +356,7 @@ export default async function handler(req, res) {
         ...lol.map(m => ({ ...m, _game: "lol" })),
       ];
 
-      push(`📊 Found ${allMatches.length} upcoming matches, ${polyEvents.length} Polymarket events`);
+      push(`📊 Found ${allMatches.length} upcoming matches, ${polyMarkets.length} Polymarket moneyline markets`);
 
       const opportunities = [];
 
@@ -346,9 +373,9 @@ export default async function handler(req, res) {
         // Check if already have position on this match
         if (state.openPositions.some(p => p.matchId === m.id)) continue;
 
-        // Try to find Polymarket odds
-        const polyOdds = matchPolymarket(polyEvents, t1.name, t2.name) ||
-                         matchPolymarket(polyEvents, t1.acronym || t1.name, t2.acronym || t2.name);
+        // Try to find Polymarket odds (try full name, then acronym)
+        const polyOdds = matchPolymarket(polyMarkets, t1.name, t2.name) ||
+                         matchPolymarket(polyMarkets, t1.acronym || t1.name, t2.acronym || t2.name);
 
         if (!polyOdds) continue; // No market price = can't calculate edge
 
@@ -448,8 +475,8 @@ export default async function handler(req, res) {
     // 4. Save state
     state.lastRunAt = now.toISOString();
     state.totalRuns = (state.totalRuns || 0) + 1;
-    // Keep only last 100 closed positions
-    state.closedPositions = (state.closedPositions || []).slice(0, 100);
+    // Keep last 500 closed positions for full trade history
+    state.closedPositions = (state.closedPositions || []).slice(0, 500);
 
     await redisSet("bot-state", state);
 
