@@ -89,7 +89,8 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
 
   for (const mkt of polyMarkets) {
     const question = norm(mkt.question || "");
-    const outcomes = (mkt.outcomes || []).map(o => norm(o));
+    const rawOutcomes = typeof mkt.outcomes === "string" ? JSON.parse(mkt.outcomes) : (mkt.outcomes || []);
+    const outcomes = rawOutcomes.map(o => norm(String(o)));
 
     // Check if both teams appear in the question or outcomes
     const allText = question + " " + outcomes.join(" ");
@@ -100,8 +101,8 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
       const prices = typeof mkt.outcomePrices === "string" ? JSON.parse(mkt.outcomePrices) : mkt.outcomePrices;
       if (prices.length >= 2) {
         // Figure out which outcome is which team
-        const o0 = norm(mkt.outcomes?.[0] || "");
-        const o1 = norm(mkt.outcomes?.[1] || "");
+        const o0 = outcomes[0] || "";
+        const o1 = outcomes[1] || "";
         const aIsFirst = o0.includes(a) || a.includes(o0);
         const probFirst = parseFloat(prices[0]) * 100;
         const probSecond = parseFloat(prices[1]) * 100;

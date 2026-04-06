@@ -111,7 +111,8 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
 
   for (const mkt of polyMarkets) {
     const question = norm(mkt.question || "");
-    const outcomes = (mkt.outcomes || []).map(o => norm(o));
+    const rawOutcomes = typeof mkt.outcomes === "string" ? JSON.parse(mkt.outcomes) : (mkt.outcomes || []);
+    const outcomes = rawOutcomes.map(o => norm(String(o)));
     const allText = question + " " + outcomes.join(" ");
     const hasA = allText.includes(a) || outcomes.some(o => o.includes(a) || a.includes(o));
     const hasB = allText.includes(b) || outcomes.some(o => o.includes(b) || b.includes(o));
@@ -119,7 +120,7 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
     if (hasA && hasB && mkt.outcomePrices) {
       const prices = typeof mkt.outcomePrices === "string" ? JSON.parse(mkt.outcomePrices) : mkt.outcomePrices;
       if (prices.length >= 2) {
-        const o0 = norm(mkt.outcomes?.[0] || "");
+        const o0 = outcomes[0] || "";
         const aIsFirst = o0.includes(a) || a.includes(o0);
         const probFirst = parseFloat(prices[0]) * 100;
         const probSecond = parseFloat(prices[1]) * 100;
