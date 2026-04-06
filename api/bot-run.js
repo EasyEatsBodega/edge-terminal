@@ -273,10 +273,7 @@ export default async function handler(req, res) {
           const result = won ? "win" : "loss";
           const pnl = won ? pos.betSize * ((100 / pos.marketProb) - 1) : -pos.betSize;
 
-          state.bankroll += won ? pos.betSize + pnl : 0; // Return stake + profit, or nothing
-          if (!won) { /* bankroll already reduced when bet was placed */ }
-          else { state.bankroll = state.bankroll; } // stake was already deducted, add back stake + profit
-          // Recalculate: when bet placed, bankroll -= betSize. If won: bankroll += betSize + profit. If lost: nothing (already deducted)
+          // When bet placed: bankroll -= betSize. If won: return stake + profit. If lost: already deducted.
           if (won) state.bankroll += pos.betSize + pnl;
 
           const closed = { ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString() };

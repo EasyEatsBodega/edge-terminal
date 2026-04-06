@@ -208,7 +208,7 @@ const calcKelly = (prob, impliedProb) => {
 export default function App() {
   const [pandaKey, setPandaKey] = useState(() => load("pandaKey", ""));
   const [keyInput, setKeyInput] = useState(() => load("pandaKey", ""));
-  const [view, setView] = useState("predictions"); // predictions | log | settings
+  const [view, setView] = useState("predictions"); // predictions | log | bot | settings
   const [gameFilter, setGameFilter] = useState("all"); // all | csgo | dota2 | lol
   const [sortBy, setSortBy] = useState("time"); // time | edge
   const [expandedMatch, setExpandedMatch] = useState(null);
@@ -223,6 +223,39 @@ export default function App() {
 
   // Bet log
   const [betLog, setBetLog] = useState(() => load("betLog2", []));
+
+  // Bot state
+  const [botState, setBotState] = useState(null);
+  const [botLoading, setBotLoading] = useState(false);
+  const [botSecret, setBotSecret] = useState(() => load("botSecret", ""));
+  const [botSecretInput, setBotSecretInput] = useState(() => load("botSecret", ""));
+  const [botRunning, setBotRunning] = useState(false);
+
+  const loadBotState = useCallback(async () => {
+    if (!botSecret) return;
+    setBotLoading(true);
+    try {
+      const r = await fetch(`/api/bot-state?secret=${encodeURIComponent(botSecret)}`);
+      if (!r.ok) throw new Error(`${r.status}`);
+      setBotState(await r.json());
+    } catch (e) { console.error("Bot state fetch failed:", e); }
+    finally { setBotLoading(false); }
+  }, [botSecret]);
+
+  const triggerBotRun = useCallback(async () => {
+    if (!botSecret) return;
+    setBotRunning(true);
+    try {
+      const r = await fetch(`/api/bot-run?secret=${encodeURIComponent(botSecret)}`);
+      const data = await r.json();
+      if (data.ok) await loadBotState();
+      return data;
+    } catch (e) { console.error("Bot run failed:", e); return { ok: false, error: e.message }; }
+    finally { setBotRunning(false); }
+  }, [botSecret, loadBotState]);
+
+  useEffect(() => { if (botSecret && view === "bot") loadBotState(); }, [botSecret, view]);
+  useEffect(() => { save("botSecret", botSecret); }, [botSecret]);
 
   // Clock
   const [clock, setClock] = useState(new Date());
@@ -439,6 +472,7 @@ export default function App() {
           {[
             { id: "predictions", label: "Predictions" },
             { id: "log", label: `Bet Log${betLog.length ? ` (${betLog.length})` : ""}` },
+            { id: "bot", label: `Bot${botState ? ` $${botState.bankroll?.toFixed(0)}` : ""}` },
           ].map(v => (
             <button key={v.id} onClick={() => setView(v.id)} style={{
               width: "100%", padding: "7px 8px", borderRadius: 6, border: "none",
@@ -727,6 +761,200 @@ export default function App() {
                 );
               })}
             </div>
+          </>)}
+
+          {/* ─── BOT DASHBOARD VIEW ─── */}
+          {view === "bot" && (<>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 16 }}>
+              <div>
+                <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: "-0.03em", margin: 0 }}>Paper Trading Bot</h1>
+                <p style={{ fontSize: 13, color: PAL.sub, marginTop: 4 }}>
+                  {botState ? `$${botState.bankroll?.toFixed(2)} bankroll · ${botState.openPositions?.length || 0} open · Run #${botState.totalRuns || 0}` : "Connect bot secret to view dashboard"}
+                </p>
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                {botSecret && (
+                  <>
+                    <button onClick={loadBotState} disabled={botLoading} style={{ ...btnSm, color: PAL.blue, borderColor: `${PAL.blue}30` }}>
+                      {botLoading ? "Loading..." : "Refresh"}
+                    </button>
+                    <button onClick={triggerBotRun} disabled={botRunning} style={{ ...btnSm, background: `${PAL.green}15`, borderColor: `${PAL.green}30`, color: PAL.green, fontWeight: 600 }}>
+                      {botRunning ? "Running..." : "Run Now"}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Bot Secret Input */}
+            {!botSecret && (
+              <div style={{ background: PAL.panel, borderRadius: 10, padding: 20, border: `1px solid ${PAL.border}`, maxWidth: 500, marginBottom: 16 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Bot Secret</div>
+                <div style={{ fontSize: 12, color: PAL.sub, marginBottom: 12 }}>
+                  Enter the BOT_SECRET you set in your Vercel environment variables.
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input value={botSecretInput} onChange={e => setBotSecretInput(e.target.value)} placeholder="Bot secret..." style={{ ...inp, flex: 1 }} type="password" />
+                  <button onClick={() => setBotSecret(botSecretInput)} style={{ ...btnSm, background: `${PAL.green}15`, borderColor: `${PAL.green}30`, color: PAL.green, fontWeight: 600 }}>Connect</button>
+                </div>
+              </div>
+            )}
+
+            {botSecret && botState && (<>
+              {/* Stats Row */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 18 }}>
+                <NumCard label="Bankroll" value={`$${botState.bankroll?.toFixed(0)}`} color={botState.bankroll >= (botState.initialBankroll || 1000) ? PAL.green : PAL.red} />
+                <NumCard label="P&L" value={`${(botState.bankroll - (botState.initialBankroll || 1000)) >= 0 ? "+" : ""}$${(botState.bankroll - (botState.initialBankroll || 1000)).toFixed(2)}`} color={(botState.bankroll - (botState.initialBankroll || 1000)) >= 0 ? PAL.green : PAL.red} />
+                <NumCard label="Open" value={botState.openPositions?.length || 0} color={PAL.yellow} sub={`/ 5 max`} />
+                <NumCard label="Closed" value={botState.closedPositions?.length || 0} color={PAL.sub} sub={(() => { const w = (botState.closedPositions || []).filter(p => p.result === "win").length; const l = (botState.closedPositions || []).filter(p => p.result === "loss").length; return `${w}W ${l}L`; })()} />
+                <NumCard label="Hit Rate" value={(() => { const cl = botState.closedPositions || []; const res = cl.filter(p => p.result); if (!res.length) return "-"; return `${(res.filter(p => p.result === "win").length / res.length * 100).toFixed(0)}%`; })()} color={PAL.purple} sub={`${botState.totalRuns || 0} runs`} />
+              </div>
+
+              {/* P&L Chart */}
+              {botState.closedPositions?.length > 1 && (
+                <div style={{ background: PAL.panel, borderRadius: 10, padding: "14px 14px 8px", border: `1px solid ${PAL.border}`, marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>P&L Curve</div>
+                  <ResponsiveContainer width="100%" height={180}>
+                    <AreaChart data={(() => {
+                      let cumPnl = 0;
+                      return [...(botState.closedPositions || [])].reverse().map((p, i) => {
+                        cumPnl += p.pnl || 0;
+                        return { name: i + 1, pnl: +cumPnl.toFixed(2) };
+                      });
+                    })()}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={PAL.faint} />
+                      <XAxis dataKey="name" tick={{ fontSize: 10, fill: PAL.dim }} />
+                      <YAxis tick={{ fontSize: 10, fill: PAL.dim }} tickFormatter={v => `$${v}`} />
+                      <Tooltip contentStyle={{ background: PAL.card, border: `1px solid ${PAL.border}`, borderRadius: 6, fontSize: 12 }} />
+                      <Area type="monotone" dataKey="pnl" stroke={PAL.green} fill={`${PAL.green}20`} strokeWidth={2} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+
+              {/* Model Weights */}
+              <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}`, marginBottom: 16 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>Model Weights (Self-Adjusting)</div>
+                <div style={{ display: "flex", gap: 16 }}>
+                  {Object.entries(botState.modelWeights || {}).filter(([k]) => k !== "formN").map(([k, v]) => (
+                    <div key={k} style={{ flex: 1 }}>
+                      <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4, textTransform: "capitalize" }}>{k}</div>
+                      <div style={{ height: 6, background: PAL.bg, borderRadius: 3, overflow: "hidden" }}>
+                        <div style={{ width: `${v * 100}%`, height: "100%", background: k === "form" ? PAL.orange : k === "overall" ? PAL.blue : PAL.purple, borderRadius: 3 }} />
+                      </div>
+                      <div style={{ fontSize: 12, fontWeight: 700, marginTop: 4, color: PAL.text }}>{(v * 100).toFixed(0)}%</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Calibration */}
+              {botState.calibration?.totalPredictions > 0 && (
+                <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}`, marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>Calibration</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
+                    <NumCard label="Total Predictions" value={botState.calibration.totalPredictions} color={PAL.text} />
+                    <NumCard label="Accuracy" value={`${(botState.calibration.correctPredictions / botState.calibration.totalPredictions * 100).toFixed(1)}%`} color={botState.calibration.correctPredictions / botState.calibration.totalPredictions > 0.55 ? PAL.green : PAL.yellow} />
+                  </div>
+                  {Object.keys(botState.calibration.bins || {}).length > 0 && (
+                    <div style={{ marginTop: 10 }}>
+                      <ResponsiveContainer width="100%" height={140}>
+                        <BarChart data={Object.entries(botState.calibration.bins).map(([bin, d]) => ({ bin, actual: +(d.wins / d.total * 100).toFixed(0), n: d.total }))}>
+                          <CartesianGrid strokeDasharray="3 3" stroke={PAL.faint} />
+                          <XAxis dataKey="bin" tick={{ fontSize: 9, fill: PAL.dim }} />
+                          <YAxis tick={{ fontSize: 9, fill: PAL.dim }} domain={[0, 100]} tickFormatter={v => `${v}%`} />
+                          <Tooltip contentStyle={{ background: PAL.card, border: `1px solid ${PAL.border}`, borderRadius: 6, fontSize: 12 }} />
+                          <Bar dataKey="actual" radius={[3, 3, 0, 0]}>
+                            {Object.entries(botState.calibration.bins).map(([bin], i) => (
+                              <Cell key={i} fill={PAL.purple} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Open Positions */}
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Open Positions ({botState.openPositions?.length || 0})</div>
+                {(!botState.openPositions || botState.openPositions.length === 0) ? (
+                  <div style={{ padding: 24, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
+                    No open positions. Bot will find edge on next run.
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    {botState.openPositions.map(p => (
+                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 70px 90px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${PAL.yellow}`, alignItems: "center", gap: 8, fontSize: 13 }}>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
+                        <div>
+                          <div style={{ fontWeight: 600 }}>{p.pick}</div>
+                          <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{" · "}{p.league}</div>
+                        </div>
+                        <div style={{ textAlign: "center" }}>
+                          <div style={{ fontSize: 12, fontWeight: 700 }}>{p.ourProb}%</div>
+                          <div style={{ fontSize: 10, color: PAL.dim }}>model</div>
+                        </div>
+                        <div style={{ textAlign: "center" }}>
+                          <div style={{ fontSize: 12, fontWeight: 700 }}>{p.marketProb}%</div>
+                          <div style={{ fontSize: 10, color: PAL.dim }}>market</div>
+                        </div>
+                        <div style={{ textAlign: "center", fontWeight: 700, color: PAL.green }}>+{p.edge}%</div>
+                        <div style={{ textAlign: "center", fontWeight: 600 }}>${p.betSize}</div>
+                        <div style={{ fontSize: 10, color: PAL.dim, textAlign: "right" }}>
+                          {new Date(p.matchTime).toLocaleDateString(undefined, { month: "short", day: "numeric" })}{" "}
+                          {new Date(p.matchTime).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Closed Positions */}
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Recent Results ({botState.closedPositions?.length || 0})</div>
+                {(!botState.closedPositions || botState.closedPositions.length === 0) ? (
+                  <div style={{ padding: 24, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
+                    No resolved bets yet.
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    {botState.closedPositions.slice(0, 25).map(p => (
+                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 80px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 8, fontSize: 13 }}>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
+                        <div>
+                          <div style={{ fontWeight: 600 }}>{p.pick}</div>
+                          <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{" · "}{p.league}</div>
+                        </div>
+                        <div style={{ textAlign: "center" }}>
+                          <div style={{ fontSize: 12, fontWeight: 700 }}>{p.ourProb}%</div>
+                          <div style={{ fontSize: 10, color: PAL.dim }}>model</div>
+                        </div>
+                        <div style={{ textAlign: "center", fontWeight: 700, color: p.result === "win" ? PAL.green : PAL.red }}>
+                          {p.result?.toUpperCase()}
+                        </div>
+                        <div style={{ textAlign: "center", fontWeight: 700, color: (p.pnl || 0) >= 0 ? PAL.green : PAL.red }}>
+                          {(p.pnl || 0) >= 0 ? "+" : ""}${(p.pnl || 0).toFixed(2)}
+                        </div>
+                        <div style={{ fontSize: 10, color: PAL.dim, textAlign: "right" }}>
+                          ${p.betSize} bet
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Last Run Info */}
+              {botState.lastRunAt && (
+                <div style={{ marginTop: 16, fontSize: 11, color: PAL.dim, textAlign: "center" }}>
+                  Last run: {new Date(botState.lastRunAt).toLocaleString()}{" · "}
+                  <button onClick={() => { setBotSecret(""); setBotSecretInput(""); save("botSecret", ""); setBotState(null); }} style={{ background: "none", border: "none", color: PAL.red, cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>Disconnect</button>
+                </div>
+              )}
+            </>)}
           </>)}
 
           {/* ─── BET LOG VIEW ─── */}

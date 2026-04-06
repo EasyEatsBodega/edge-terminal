@@ -1,5 +1,11 @@
 {
   "rewrites": [
     { "source": "/api/:path*", "destination": "/api/:path*" }
+  ],
+  "crons": [
+    {
+      "path": "/api/bot-run",
+      "schedule": "0 */4 * * *"
+    }
   ]
 }
