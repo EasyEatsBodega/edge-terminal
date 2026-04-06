@@ -4,3 +4,5 @@ dist
 .env.local
 .vercel
 *.log
+bot/state.json
+bot/config.json

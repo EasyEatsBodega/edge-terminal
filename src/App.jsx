@@ -266,38 +266,43 @@ export default function App() {
   // Bet log
   const [betLog, setBetLog] = useState(() => load("betLog2", []));
 
-  // Bot state
+  // Bot state — connects to VPS bot server
   const [botState, setBotState] = useState(null);
   const [botLoading, setBotLoading] = useState(false);
   const [botSecret, setBotSecret] = useState(() => load("botSecret", ""));
   const [botSecretInput, setBotSecretInput] = useState(() => load("botSecret", ""));
+  const [botUrl, setBotUrl] = useState(() => load("botUrl", ""));
+  const [botUrlInput, setBotUrlInput] = useState(() => load("botUrl", ""));
   const [botRunning, setBotRunning] = useState(false);
 
   const loadBotState = useCallback(async () => {
-    if (!botSecret) return;
+    if (!botSecret || !botUrl) return;
     setBotLoading(true);
     try {
-      const r = await fetch(`/api/bot-state?secret=${encodeURIComponent(botSecret)}`);
+      const base = botUrl.replace(/\/+$/, "");
+      const r = await fetch(`${base}/state?secret=${encodeURIComponent(botSecret)}`);
       if (!r.ok) throw new Error(`${r.status}`);
       setBotState(await r.json());
     } catch (e) { console.error("Bot state fetch failed:", e); }
     finally { setBotLoading(false); }
-  }, [botSecret]);
+  }, [botSecret, botUrl]);
 
   const triggerBotRun = useCallback(async () => {
-    if (!botSecret) return;
+    if (!botSecret || !botUrl) return;
     setBotRunning(true);
     try {
-      const r = await fetch(`/api/bot-run?secret=${encodeURIComponent(botSecret)}`);
+      const base = botUrl.replace(/\/+$/, "");
+      const r = await fetch(`${base}/run?secret=${encodeURIComponent(botSecret)}`);
       const data = await r.json();
       if (data.ok) await loadBotState();
       return data;
     } catch (e) { console.error("Bot run failed:", e); return { ok: false, error: e.message }; }
     finally { setBotRunning(false); }
-  }, [botSecret, loadBotState]);
+  }, [botSecret, botUrl, loadBotState]);
 
-  useEffect(() => { if (botSecret && view === "bot") loadBotState(); }, [botSecret, view]);
+  useEffect(() => { if (botSecret && botUrl && view === "bot") loadBotState(); }, [botSecret, botUrl, view]);
   useEffect(() => { save("botSecret", botSecret); }, [botSecret]);
+  useEffect(() => { save("botUrl", botUrl); }, [botUrl]);
 
   // Clock
   const [clock, setClock] = useState(new Date());
@@ -845,16 +850,17 @@ export default function App() {
               </div>
             </div>
 
-            {/* Bot Secret Input */}
-            {!botSecret && (
+            {/* Bot Connection */}
+            {(!botSecret || !botUrl) && (
               <div style={{ background: PAL.panel, borderRadius: 10, padding: 20, border: `1px solid ${PAL.border}`, maxWidth: 500, marginBottom: 16 }}>
-                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Bot Secret</div>
+                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Connect to Bot</div>
                 <div style={{ fontSize: 12, color: PAL.sub, marginBottom: 12 }}>
-                  Enter the BOT_SECRET you set in your Vercel environment variables.
+                  Enter your VPS bot URL and secret to view the dashboard.
                 </div>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <input value={botSecretInput} onChange={e => setBotSecretInput(e.target.value)} placeholder="Bot secret..." style={{ ...inp, flex: 1 }} type="password" />
-                  <button onClick={() => setBotSecret(botSecretInput)} style={{ ...btnSm, background: `${PAL.green}15`, borderColor: `${PAL.green}30`, color: PAL.green, fontWeight: 600 }}>Connect</button>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <input value={botUrlInput} onChange={e => setBotUrlInput(e.target.value)} placeholder="http://142.93.228.49:3069" style={{ ...inp }} />
+                  <input value={botSecretInput} onChange={e => setBotSecretInput(e.target.value)} placeholder="Bot secret..." style={{ ...inp }} type="password" />
+                  <button onClick={() => { setBotUrl(botUrlInput); setBotSecret(botSecretInput); }} style={{ ...btnSm, background: `${PAL.green}15`, borderColor: `${PAL.green}30`, color: PAL.green, fontWeight: 600, alignSelf: "flex-start" }}>Connect</button>
                 </div>
               </div>
             )}
@@ -1024,7 +1030,7 @@ export default function App() {
               {botState.lastRunAt && (
                 <div style={{ marginTop: 16, fontSize: 11, color: PAL.dim, textAlign: "center" }}>
                   Last run: {new Date(botState.lastRunAt).toLocaleString()}{" · "}
-                  <button onClick={() => { setBotSecret(""); setBotSecretInput(""); save("botSecret", ""); setBotState(null); }} style={{ background: "none", border: "none", color: PAL.red, cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>Disconnect</button>
+                  <button onClick={() => { setBotSecret(""); setBotSecretInput(""); setBotUrl(""); setBotUrlInput(""); save("botSecret", ""); save("botUrl", ""); setBotState(null); }} style={{ background: "none", border: "none", color: PAL.red, cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>Disconnect</button>
                 </div>
               )}
             </>)}
