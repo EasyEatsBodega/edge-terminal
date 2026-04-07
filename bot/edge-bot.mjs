@@ -32,15 +32,15 @@ const CFG = loadConfig();
 
 const INITIAL_BANKROLL = 1000;
 const MAX_DEPLOYED_PCT = 25;
-const MAX_POSITIONS = 5;
-const MIN_EDGE = 5;
+const MAX_POSITIONS = 8;
+const MIN_EDGE = 4;
 const MAX_BET_PCT = 8;
 const MIN_BET = 10;
 const BET_WINDOW_MIN_H = 0.5;
 const BET_WINDOW_MAX_H = 48;
-const MIN_LIQUIDITY = 2000;       // Skip markets with < $2k liquidity (no real price discovery)
-const MIN_OUR_PROB = 58;          // Only bet teams we give 58%+ to win
-const BETS_PER_RUN = 2;           // Take up to 2 best bets per run
+const MIN_LIQUIDITY = 1000;       // Skip markets with < $1k liquidity (no real price discovery)
+const MIN_OUR_PROB = 55;          // Only bet teams we give 55%+ to win
+const BETS_PER_RUN = 3;           // Take up to 3 best bets per run
 
 // ─── File-Based State ───────────────────────────────────────────────────────
 
