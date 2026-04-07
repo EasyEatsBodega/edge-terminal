@@ -293,8 +293,8 @@ export default async function handler(req, res) {
       if (!toResolve.includes(pos)) { stillOpen.push(pos); continue; }
 
       try {
-        const match = await pandaFetch(`${pos.game}/matches/${pos.matchId}`);
-        if (match.status === "finished" && match.winner) {
+        const match = await pandaFetch(`matches/${pos.matchId}`);
+        if ((match.status === "finished" || match.status === "canceled") && match.winner) {
           const won = (pos.pickSide === "A" && match.winner.id === pos.teamAId) ||
                       (pos.pickSide === "B" && match.winner.id === pos.teamBId);
 
