@@ -30,13 +30,16 @@ const CFG = loadConfig();
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INITIAL_BANKROLL = 1000;
-const MAX_DEPLOYED_PCT = 20;
+const MAX_DEPLOYED_PCT = 25;
 const MAX_POSITIONS = 5;
-const MIN_EDGE = 3;
-const MAX_BET_PCT = 6;
+const MIN_EDGE = 5;
+const MAX_BET_PCT = 8;
 const MIN_BET = 10;
 const BET_WINDOW_MIN_H = 0.5;
 const BET_WINDOW_MAX_H = 48;
+const MIN_LIQUIDITY = 2000;       // Skip markets with < $2k liquidity (no real price discovery)
+const MIN_OUR_PROB = 58;          // Only bet teams we give 58%+ to win
+const BETS_PER_RUN = 2;           // Take up to 2 best bets per run
 
 // ─── File-Based State ───────────────────────────────────────────────────────
 
@@ -124,9 +127,17 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
         const aIsFirst = o0.includes(a) || a.includes(o0);
         const probFirst = parseFloat(prices[0]) * 100;
         const probSecond = parseFloat(prices[1]) * 100;
+        const liquidity = parseFloat(mkt.liquidity) || 0;
+        const volume = parseFloat(mkt.volume) || 0;
+        const slug = mkt.slug || "";
+        const polyUrl = slug ? `https://polymarket.com/event/${slug}` : null;
         return {
           probA: aIsFirst ? probFirst : probSecond,
           probB: aIsFirst ? probSecond : probFirst,
+          liquidity,
+          volume,
+          slug,
+          polyUrl,
         };
       }
     }
@@ -359,10 +370,11 @@ async function runBot() {
     const canBet = state.openPositions.length < MAX_POSITIONS && deployedPct < MAX_DEPLOYED_PCT && state.bankroll > MIN_BET;
 
     if (canBet) {
+      // Fetch MORE matches per game to scan wider
       const [csgo, dota2, lol, polyMarkets] = await Promise.all([
-        pandaFetch("csgo/matches/upcoming?per_page=15&sort=scheduled_at").catch(() => []),
-        pandaFetch("dota2/matches/upcoming?per_page=15&sort=scheduled_at").catch(() => []),
-        pandaFetch("lol/matches/upcoming?per_page=15&sort=scheduled_at").catch(() => []),
+        pandaFetch("csgo/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
+        pandaFetch("dota2/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
+        pandaFetch("lol/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
       ]);
 
@@ -375,6 +387,7 @@ async function runBot() {
       push(`📊 Found ${allMatches.length} upcoming matches, ${polyMarkets.length} Polymarket moneyline markets`);
 
       const opportunities = [];
+      let skippedLowLiq = 0;
 
       for (const m of allMatches) {
         const t1 = m.opponents?.[0]?.opponent;
@@ -390,18 +403,28 @@ async function runBot() {
                          matchPolymarket(polyMarkets, t1.acronym || t1.name, t2.acronym || t2.name);
         if (!polyOdds) continue;
 
+        // FILTER: Skip low-liquidity markets — prices are meaningless without real money behind them
+        if (polyOdds.liquidity < MIN_LIQUIDITY) {
+          skippedLowLiq++;
+          continue;
+        }
+
+        // FILTER: Skip markets where both sides are 40-60% — no real price discovery
+        const maxProb = Math.max(polyOdds.probA, polyOdds.probB);
+        if (maxProb < 60) {
+          skippedLowLiq++;
+          continue;
+        }
+
         opportunities.push({ match: m, t1, t2, polyOdds });
       }
 
-      push(`🎯 ${opportunities.length} matches with Polymarket odds`);
+      push(`🎯 ${opportunities.length} quality matches (skipped ${skippedLowLiq} low-liquidity/no-edge markets)`);
 
-      const toAnalyze = opportunities.slice(0, 8);
+      // Analyze ALL matched opportunities, not just first 8
+      const analyzed = [];
 
-      for (const opp of toAnalyze) {
-        if (state.openPositions.length >= MAX_POSITIONS) break;
-        const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
-        if (currentDeployed / state.bankroll * 100 >= MAX_DEPLOYED_PCT) break;
-
+      for (const opp of opportunities) {
         try {
           const [histA, histB] = await Promise.all([
             pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t1.id}&per_page=25&sort=-scheduled_at`),
@@ -410,68 +433,99 @@ async function runBot() {
 
           const pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights);
 
-          // Only bet on the team we think WINS (>50%) where market undervalues them
           const pickSide = pred.probA >= pred.probB ? "A" : "B";
           const ourProb = pickSide === "A" ? pred.probA : pred.probB;
           const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
           const edge = ourProb - marketProb;
 
-          if (ourProb < 52) continue;    // Must believe team wins convincingly
-          if (edge < MIN_EDGE) continue;  // Must have real edge vs market
-          if (pred.confidence === "low" && edge < 8) continue;
+          if (ourProb < MIN_OUR_PROB) continue;   // Must strongly believe team wins
+          if (edge < MIN_EDGE) continue;           // Must have real edge vs market
+          if (pred.confidence === "low" && edge < 10) continue;  // Low confidence needs BIG edge
 
-          const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
-          const betSize = calcBetSize(edge, state.bankroll, pred.confidence);
-
-          if (betSize > state.bankroll - currentDeployed) continue;
-
-          const position = {
-            id: `bet_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            matchId: opp.match.id,
-            game: opp.match._game,
-            teamA: opp.t1.acronym || opp.t1.name,
-            teamB: opp.t2.acronym || opp.t2.name,
-            teamAId: opp.t1.id,
-            teamBId: opp.t2.id,
-            pick, pickSide,
-            ourProb: +(pickSide === "A" ? pred.probA : pred.probB).toFixed(1),
-            marketProb: +(pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB).toFixed(1),
-            edge: +edge.toFixed(1),
-            betSize,
-            betPercent: +(betSize / state.bankroll * 100).toFixed(1),
-            confidence: pred.confidence,
-            event: `${opp.t1.acronym || opp.t1.name} vs ${opp.t2.acronym || opp.t2.name}`,
-            league: opp.match.league?.name || "",
-            format: opp.match.number_of_games || 1,
-            placedAt: now.toISOString(),
-            matchTime: opp.match.scheduled_at,
-            formA: pred.recordA,
-            formB: pred.recordB,
-          };
-
-          state.openPositions.push(position);
-          state.bankroll -= betSize;
-
-          push(`💰 BET PLACED: ${pick} in ${position.event} | Edge: ${edge.toFixed(1)}% | Size: $${betSize} (${position.betPercent}%)`);
-
-          await sendTG(
-            `💰 <b>NEW PAPER BET</b>\n\n` +
-            `🎮 ${opp.match._game.toUpperCase()}\n` +
-            `📋 ${position.event}\n` +
-            `🏆 ${position.league} · BO${position.format}\n\n` +
-            `<b>Pick: ${pick}</b>\n` +
-            `Our model: <b>${position.ourProb}%</b>\n` +
-            `Market: <b>${position.marketProb}%</b>\n` +
-            `Edge: <b>+${position.edge}%</b>\n` +
-            `Confidence: ${position.confidence}\n\n` +
-            `💵 Bet: <b>$${betSize}</b> (${position.betPercent}% of bankroll)\n` +
-            `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n` +
-            `📊 Open positions: ${state.openPositions.length}/${MAX_POSITIONS}\n\n` +
-            `⏰ Match: ${new Date(position.matchTime).toLocaleString()}`
-          );
+          analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
         } catch (e) {
           push(`⚠️ Error analyzing ${opp.t1.name} vs ${opp.t2.name}: ${e.message}`);
         }
+      }
+
+      // RANK by win probability (highest first) — we want the BEST chance to WIN
+      analyzed.sort((a, b) => b.ourProb - a.ourProb);
+
+      if (analyzed.length > 0) {
+        push(`🏆 ${analyzed.length} opportunities pass filters — top picks:`);
+        for (let i = 0; i < Math.min(analyzed.length, 5); i++) {
+          const a = analyzed[i];
+          const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
+          push(`   ${i + 1}. ${pick} (${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}) — Model: ${a.ourProb.toFixed(1)}% | Market: ${a.marketProb.toFixed(1)}% | Edge: +${a.edge.toFixed(1)}% | Liq: $${a.opp.polyOdds.liquidity.toFixed(0)}`);
+        }
+      } else {
+        push("📭 No opportunities pass quality filters this run");
+      }
+
+      // Take only the BEST bet (highest win probability)
+      const betsPlaced = [];
+      for (const a of analyzed) {
+        if (betsPlaced.length >= BETS_PER_RUN) break;
+        if (state.openPositions.length >= MAX_POSITIONS) break;
+        const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
+        if (currentDeployed / state.bankroll * 100 >= MAX_DEPLOYED_PCT) break;
+
+        const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
+        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence);
+
+        if (betSize > state.bankroll - currentDeployed) continue;
+
+        const position = {
+          id: `bet_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          matchId: a.opp.match.id,
+          game: a.opp.match._game,
+          teamA: a.opp.t1.acronym || a.opp.t1.name,
+          teamB: a.opp.t2.acronym || a.opp.t2.name,
+          teamAId: a.opp.t1.id,
+          teamBId: a.opp.t2.id,
+          pick, pickSide: a.pickSide,
+          ourProb: +a.ourProb.toFixed(1),
+          marketProb: +a.marketProb.toFixed(1),
+          edge: +a.edge.toFixed(1),
+          betSize,
+          betPercent: +(betSize / state.bankroll * 100).toFixed(1),
+          confidence: a.pred.confidence,
+          event: `${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}`,
+          league: a.opp.match.league?.name || "",
+          format: a.opp.match.number_of_games || 1,
+          placedAt: now.toISOString(),
+          matchTime: a.opp.match.scheduled_at,
+          formA: a.pred.recordA,
+          formB: a.pred.recordB,
+          polyUrl: a.opp.polyOdds.polyUrl || null,
+          polyLiquidity: a.opp.polyOdds.liquidity,
+        };
+
+        state.openPositions.push(position);
+        state.bankroll -= betSize;
+        betsPlaced.push(position);
+
+        push(`💰 BET PLACED: ${pick} in ${position.event} | Model: ${position.ourProb}% | Market: ${position.marketProb}% | Edge: +${position.edge}% | Size: $${betSize} | Liq: $${position.polyLiquidity.toFixed(0)}`);
+
+        const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
+
+        await sendTG(
+          `💰 <b>NEW PAPER BET</b>\n\n` +
+          `🎮 ${a.opp.match._game.toUpperCase()}\n` +
+          `📋 ${position.event}\n` +
+          `🏆 ${position.league} · BO${position.format}\n\n` +
+          `<b>Pick: ${pick}</b>\n` +
+          `Our model: <b>${position.ourProb}%</b>\n` +
+          `Market: <b>${position.marketProb}%</b>\n` +
+          `Edge: <b>+${position.edge}%</b>\n` +
+          `Confidence: ${position.confidence}\n` +
+          `Liquidity: $${position.polyLiquidity.toFixed(0)}\n\n` +
+          `💵 Bet: <b>$${betSize}</b> (${position.betPercent}% of bankroll)\n` +
+          `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n` +
+          `📊 Open positions: ${state.openPositions.length}/${MAX_POSITIONS}\n\n` +
+          `⏰ Match: ${new Date(position.matchTime).toLocaleString()}` +
+          polyLink
+        );
       }
     } else {
       if (state.openPositions.length >= MAX_POSITIONS) push("⏸️ Max positions reached");
@@ -573,12 +627,6 @@ const server = createServer(async (req, res) => {
 
 const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
 
-function buildPolymarketLink(game, teamA, teamB) {
-  // Best-effort Polymarket link — search page
-  const slug = game === "csgo" ? "cs2" : game;
-  return `https://polymarket.com/esports/${slug}/games`;
-}
-
 async function handleTelegramCommand(text) {
   const state = loadState();
   if (!state) return "Bot hasn't run yet. No state available.";
@@ -601,7 +649,7 @@ async function handleTelegramCommand(text) {
       const p = open[i];
       const game = GAME_LABEL[p.game] || p.game;
       const matchDate = new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
-      const link = buildPolymarketLink(p.game, p.teamA, p.teamB);
+      const link = p.polyUrl || `https://polymarket.com/markets/esports`;
 
       // Get live Polymarket price for this position
       const liveOdds = matchPolymarket(polyMarkets, p.teamA, p.teamB);
@@ -629,7 +677,8 @@ async function handleTelegramCommand(text) {
       msg += `   Model: ${p.ourProb}% | Edge: +${p.edge}%\n`;
       if (livePnlStr) msg += `   Live P&L: <b>${livePnlStr}</b>\n`;
       msg += `   ${p.league} · BO${p.format} · ${matchDate} UTC\n`;
-      msg += `   🔗 <a href="${link}">Polymarket</a>\n\n`;
+      if (p.polyLiquidity) msg += `   💧 Liquidity: $${p.polyLiquidity.toFixed(0)}\n`;
+      msg += `   🔗 <a href="${link}">View on Polymarket</a>\n\n`;
     }
 
     // Total unrealized P&L
@@ -689,11 +738,38 @@ async function handleTelegramCommand(text) {
     return result.ok ? "✅ Bot run complete." : `❌ Bot run failed: ${result.error}`;
   }
 
+  if (cmd === "/reset") {
+    const freshState = {
+      bankroll: INITIAL_BANKROLL,
+      initialBankroll: INITIAL_BANKROLL,
+      openPositions: [],
+      closedPositions: [],
+      modelWeights: { form: 0.45, overall: 0.35, h2h: 0.15, formN: 10 },
+      calibration: { totalPredictions: 0, correctPredictions: 0, bins: {} },
+      lastRunAt: null,
+      totalRuns: 0,
+    };
+    saveState(freshState);
+    return `🔄 <b>BOT RESET</b>\n\nAll positions cleared.\nBankroll reset to $${INITIAL_BANKROLL}.\nReady for fresh start.`;
+  }
+
+  if (cmd === "/cancel") {
+    if (!state.openPositions.length) return "📭 No open positions to cancel.";
+    const refund = state.openPositions.reduce((s, p) => s + p.betSize, 0);
+    state.bankroll += refund;
+    const count = state.openPositions.length;
+    state.openPositions = [];
+    saveState(state);
+    return `🚫 <b>CANCELED ${count} POSITIONS</b>\n\n$${refund} returned to bankroll.\nBankroll: <b>$${state.bankroll.toFixed(2)}</b>\n\nPrevious closed trades preserved.`;
+  }
+
   if (cmd === "/help") {
     return `🤖 <b>Edge Terminal Bot</b>\n\n` +
-      `/trades — View open positions\n` +
+      `/trades — View open positions with live prices\n` +
       `/status — Bankroll, P&L, win rate\n` +
       `/run — Trigger a bot run now\n` +
+      `/cancel — Cancel all open positions\n` +
+      `/reset — Full reset (clears everything)\n` +
       `/help — This message`;
   }
 

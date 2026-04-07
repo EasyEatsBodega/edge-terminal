@@ -74,7 +74,14 @@ function matchPolyOdds(polyMarkets, teamA, teamB) {
         const aIsFirst = o0.includes(a) || a.includes(o0);
         const probFirst = parseFloat(prices[0]) * 100;
         const probSecond = parseFloat(prices[1]) * 100;
-        return { probA: +(aIsFirst ? probFirst : probSecond).toFixed(1) };
+        const liquidity = parseFloat(mkt.liquidity) || 0;
+        const slug = mkt.slug || "";
+        const polyUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+        return {
+          probA: +(aIsFirst ? probFirst : probSecond).toFixed(1),
+          probB: +(aIsFirst ? probSecond : probFirst).toFixed(1),
+          liquidity, slug, polyUrl,
+        };
       }
     }
   }
