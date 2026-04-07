@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { execSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "config.json");
@@ -763,11 +764,28 @@ async function handleTelegramCommand(text) {
     return `🚫 <b>CANCELED ${count} POSITIONS</b>\n\n$${refund} returned to bankroll.\nBankroll: <b>$${state.bankroll.toFixed(2)}</b>\n\nPrevious closed trades preserved.`;
   }
 
+  if (cmd === "/deploy") {
+    try {
+      const repoDir = join(__dirname, "..");
+      const pullResult = execSync("git pull", { cwd: repoDir, timeout: 30000 }).toString().trim();
+      if (pullResult.includes("Already up to date")) {
+        return "✅ Already up to date. No changes to deploy.";
+      }
+      await sendTG(`🚀 <b>DEPLOYING</b>\n\n<code>${pullResult}</code>\n\nRestarting bot in 2 seconds...`);
+      // Give Telegram time to send the message, then exit — systemd will auto-restart us
+      setTimeout(() => process.exit(0), 2000);
+      return null; // Don't send another message
+    } catch (e) {
+      return `❌ Deploy failed: ${e.message}`;
+    }
+  }
+
   if (cmd === "/help") {
     return `🤖 <b>Edge Terminal Bot</b>\n\n` +
       `/trades — View open positions with live prices\n` +
       `/status — Bankroll, P&L, win rate\n` +
       `/run — Trigger a bot run now\n` +
+      `/deploy — Pull latest code + restart\n` +
       `/cancel — Cancel all open positions\n` +
       `/reset — Full reset (clears everything)\n` +
       `/help — This message`;
