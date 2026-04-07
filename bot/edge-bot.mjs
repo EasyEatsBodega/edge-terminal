@@ -223,8 +223,8 @@ function calcBetSize(edge, bankroll, confidence) {
 
   let size = Math.round(kellyFull * fraction);
   size = Math.max(MIN_BET, size);
-  size = Math.min(bankroll * MAX_BET_PCT / 100, size);
-  return size;
+  size = Math.min(Math.round(bankroll * MAX_BET_PCT / 100), size);
+  return Math.round(size);
 }
 
 // ─── Self-Improving Model ───────────────────────────────────────────────────
