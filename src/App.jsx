@@ -312,6 +312,13 @@ export default function App() {
   useEffect(() => { save("botSecret", botSecret); }, [botSecret]);
   useEffect(() => { save("botUrl", botUrl); }, [botUrl]);
 
+  // Auto-refresh bot state every 30s when on bot view
+  useEffect(() => {
+    if (view !== "bot" || !botSecret || !botUrl) return;
+    const t = setInterval(loadBotState, 30000);
+    return () => clearInterval(t);
+  }, [view, botSecret, botUrl, loadBotState]);
+
   // Clock
   const [clock, setClock] = useState(new Date());
   useEffect(() => { const t = setInterval(() => setClock(new Date()), 1000); return () => clearInterval(t); }, []);
@@ -841,7 +848,7 @@ export default function App() {
               <div>
                 <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: "-0.03em", margin: 0 }}>Paper Trading Bot</h1>
                 <p style={{ fontSize: 13, color: PAL.sub, marginTop: 4 }}>
-                  {botState ? `$${botState.bankroll?.toFixed(2)} bankroll · ${botState.openPositions?.length || 0} open · Run #${botState.totalRuns || 0}` : "Connect bot secret to view dashboard"}
+                  {botState ? <>Live dashboard · Auto-refreshes every 30s · Run #{botState.totalRuns || 0}</> : "Connect bot to view dashboard"}
                 </p>
               </div>
               <div style={{ display: "flex", gap: 6 }}>
@@ -873,97 +880,195 @@ export default function App() {
               </div>
             )}
 
-            {botSecret && botState && (<>
-              {/* Stats Row */}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 18 }}>
-                <NumCard label="Bankroll" value={`$${botState.bankroll?.toFixed(0)}`} color={botState.bankroll >= (botState.initialBankroll || 1000) ? PAL.green : PAL.red} />
-                <NumCard label="P&L" value={`${(botState.bankroll - (botState.initialBankroll || 1000)) >= 0 ? "+" : ""}$${(botState.bankroll - (botState.initialBankroll || 1000)).toFixed(2)}`} color={(botState.bankroll - (botState.initialBankroll || 1000)) >= 0 ? PAL.green : PAL.red} />
-                <NumCard label="Open" value={botState.openPositions?.length || 0} color={PAL.yellow} sub={`/ 5 max`} />
-                <NumCard label="Closed" value={botState.closedPositions?.length || 0} color={PAL.sub} sub={(() => { const w = (botState.closedPositions || []).filter(p => p.result === "win").length; const l = (botState.closedPositions || []).filter(p => p.result === "loss").length; return `${w}W ${l}L`; })()} />
-                <NumCard label="Hit Rate" value={(() => { const cl = botState.closedPositions || []; const res = cl.filter(p => p.result); if (!res.length) return "-"; return `${(res.filter(p => p.result === "win").length / res.length * 100).toFixed(0)}%`; })()} color={PAL.purple} sub={`${botState.totalRuns || 0} runs`} />
+            {botSecret && botState && (() => {
+              const closed = botState.closedPositions || [];
+              const open = botState.openPositions || [];
+              const initial = botState.initialBankroll || 1000;
+              const pnl = botState.bankroll - initial;
+              const roi = (pnl / initial * 100);
+              const wins = closed.filter(p => p.result === "win").length;
+              const losses = closed.filter(p => p.result === "loss").length;
+              const totalResolved = wins + losses;
+              const hitRate = totalResolved > 0 ? (wins / totalResolved * 100) : 0;
+              const totalPnl = closed.reduce((s, p) => s + (p.pnl || 0), 0);
+              const deployed = open.reduce((s, p) => s + p.betSize, 0);
+              const avgEdge = closed.length > 0 ? (closed.reduce((s, p) => s + (p.edge || 0), 0) / closed.length) : 0;
+              const avgBet = closed.length > 0 ? (closed.reduce((s, p) => s + p.betSize, 0) / closed.length) : 0;
+              const bestTrade = closed.length > 0 ? closed.reduce((best, p) => (p.pnl || 0) > (best.pnl || 0) ? p : best, closed[0]) : null;
+              const worstTrade = closed.length > 0 ? closed.reduce((worst, p) => (p.pnl || 0) < (worst.pnl || 0) ? p : worst, closed[0]) : null;
+
+              // Current streak
+              let streakType = null, streakCount = 0;
+              for (const p of closed) {
+                if (!streakType) { streakType = p.result; streakCount = 1; }
+                else if (p.result === streakType) streakCount++;
+                else break;
+              }
+
+              // Bankroll history for chart
+              const bankrollHistory = (() => {
+                const points = [{ label: "Start", bankroll: initial, pnl: 0 }];
+                let running = initial;
+                const reversed = [...closed].reverse();
+                reversed.forEach((p, i) => {
+                  running += (p.pnl || 0);
+                  const date = p.resolvedAt || p.placedAt;
+                  const label = date ? new Date(date).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : `#${i + 1}`;
+                  points.push({ label, bankroll: +running.toFixed(2), pnl: +(running - initial).toFixed(2), trade: `${p.pick} ${p.result}` });
+                });
+                // Add current state (includes deployed capital)
+                if (open.length > 0) {
+                  points.push({ label: "Now", bankroll: +(botState.bankroll + deployed).toFixed(2), pnl: +(botState.bankroll + deployed - initial).toFixed(2), trade: `${open.length} open` });
+                }
+                return points;
+              })();
+
+              // P&L by game
+              const gameStats = {};
+              closed.forEach(p => {
+                const g = p.game || "unknown";
+                if (!gameStats[g]) gameStats[g] = { wins: 0, losses: 0, pnl: 0 };
+                if (p.result === "win") gameStats[g].wins++;
+                else gameStats[g].losses++;
+                gameStats[g].pnl += (p.pnl || 0);
+              });
+
+              return (<>
+              {/* Hero Stats */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
+                <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
+                  <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>Bankroll</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: pnl >= 0 ? PAL.green : PAL.red, lineHeight: 1 }}>${botState.bankroll?.toFixed(2)}</div>
+                  <div style={{ fontSize: 12, color: PAL.dim, marginTop: 6 }}>${deployed.toFixed(0)} deployed · ${(botState.bankroll + deployed).toFixed(0)} total</div>
+                </div>
+                <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
+                  <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>P&L</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: pnl >= 0 ? PAL.green : PAL.red, lineHeight: 1 }}>{pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}</div>
+                  <div style={{ fontSize: 12, color: pnl >= 0 ? PAL.green : PAL.red, marginTop: 6 }}>{roi >= 0 ? "+" : ""}{roi.toFixed(1)}% ROI</div>
+                </div>
+                <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
+                  <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>Record</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: PAL.text, lineHeight: 1 }}>{wins}W - {losses}L</div>
+                  <div style={{ fontSize: 12, color: hitRate >= 50 ? PAL.green : PAL.red, marginTop: 6 }}>
+                    {hitRate.toFixed(0)}% hit rate
+                    {streakCount > 0 && <span style={{ color: PAL.dim }}> · {streakCount}{streakType === "win" ? "W" : "L"} streak</span>}
+                  </div>
+                </div>
               </div>
 
-              {/* P&L Chart */}
-              {botState.closedPositions?.length > 1 && (
+              {/* Secondary Stats */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 18 }}>
+                <NumCard label="Avg Edge" value={`${avgEdge.toFixed(1)}%`} color={PAL.purple} />
+                <NumCard label="Avg Bet" value={`$${avgBet.toFixed(0)}`} color={PAL.sub} />
+                <NumCard label="Best Trade" value={bestTrade ? `+$${(bestTrade.pnl || 0).toFixed(0)}` : "-"} color={PAL.green} sub={bestTrade?.pick || ""} />
+                <NumCard label="Worst Trade" value={worstTrade ? `$${(worstTrade.pnl || 0).toFixed(0)}` : "-"} color={PAL.red} sub={worstTrade?.pick || ""} />
+                <NumCard label="Open" value={open.length} color={PAL.yellow} sub={`/ 5 max · ${(botState.totalRuns || 0)} runs`} />
+              </div>
+
+              {/* Bankroll Chart */}
+              {bankrollHistory.length > 1 && (
                 <div style={{ background: PAL.panel, borderRadius: 10, padding: "14px 14px 8px", border: `1px solid ${PAL.border}`, marginBottom: 16 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>P&L Curve</div>
-                  <ResponsiveContainer width="100%" height={180}>
-                    <AreaChart data={(() => {
-                      let cumPnl = 0;
-                      return [...(botState.closedPositions || [])].reverse().map((p, i) => {
-                        cumPnl += p.pnl || 0;
-                        return { name: i + 1, pnl: +cumPnl.toFixed(2) };
-                      });
-                    })()}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: PAL.sub }}>Bankroll Over Time</div>
+                    <div style={{ fontSize: 11, color: PAL.dim }}>Starting: ${initial} · Current: ${(botState.bankroll + deployed).toFixed(0)}</div>
+                  </div>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <AreaChart data={bankrollHistory}>
                       <CartesianGrid strokeDasharray="3 3" stroke={PAL.faint} />
-                      <XAxis dataKey="name" tick={{ fontSize: 10, fill: PAL.dim }} />
-                      <YAxis tick={{ fontSize: 10, fill: PAL.dim }} tickFormatter={v => `$${v}`} />
-                      <Tooltip contentStyle={{ background: PAL.card, border: `1px solid ${PAL.border}`, borderRadius: 6, fontSize: 12 }} />
-                      <Area type="monotone" dataKey="pnl" stroke={PAL.green} fill={`${PAL.green}20`} strokeWidth={2} />
+                      <XAxis dataKey="label" tick={{ fontSize: 10, fill: PAL.dim }} />
+                      <YAxis tick={{ fontSize: 10, fill: PAL.dim }} tickFormatter={v => `$${v}`} domain={["dataMin - 50", "dataMax + 50"]} />
+                      <Tooltip
+                        contentStyle={{ background: PAL.card, border: `1px solid ${PAL.border}`, borderRadius: 6, fontSize: 12 }}
+                        formatter={(v, name) => [`$${v}`, name === "bankroll" ? "Bankroll" : "P&L"]}
+                        labelFormatter={(label, payload) => payload?.[0]?.payload?.trade ? `${label} — ${payload[0].payload.trade}` : label}
+                      />
+                      <Area type="monotone" dataKey="bankroll" stroke={pnl >= 0 ? PAL.green : PAL.red} fill={pnl >= 0 ? `${PAL.green}15` : `${PAL.red}15`} strokeWidth={2} dot={{ r: 3, fill: PAL.card, stroke: pnl >= 0 ? PAL.green : PAL.red, strokeWidth: 2 }} />
                     </AreaChart>
                   </ResponsiveContainer>
                 </div>
               )}
 
-              {/* Model Weights */}
-              <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}`, marginBottom: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>Model Weights (Self-Adjusting)</div>
-                <div style={{ display: "flex", gap: 16 }}>
-                  {Object.entries(botState.modelWeights || {}).filter(([k]) => k !== "formN").map(([k, v]) => (
-                    <div key={k} style={{ flex: 1 }}>
-                      <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4, textTransform: "capitalize" }}>{k}</div>
-                      <div style={{ height: 6, background: PAL.bg, borderRadius: 3, overflow: "hidden" }}>
-                        <div style={{ width: `${v * 100}%`, height: "100%", background: k === "form" ? PAL.orange : k === "overall" ? PAL.blue : PAL.purple, borderRadius: 3 }} />
-                      </div>
-                      <div style={{ fontSize: 12, fontWeight: 700, marginTop: 4, color: PAL.text }}>{(v * 100).toFixed(0)}%</div>
+              {/* P&L by Game */}
+              {Object.keys(gameStats).length > 0 && (
+                <div style={{ display: "grid", gridTemplateColumns: `repeat(${Object.keys(gameStats).length}, 1fr)`, gap: 8, marginBottom: 16 }}>
+                  {Object.entries(gameStats).map(([game, stats]) => (
+                    <div key={game} style={{ background: PAL.panel, borderRadius: 8, padding: "12px 14px", border: `1px solid ${PAL.border}`, borderTop: `3px solid ${GAME_COLOR[game] || PAL.purple}` }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: GAME_COLOR[game] || PAL.sub, marginBottom: 6 }}>{GAME_LABEL[game] || game}</div>
+                      <div style={{ fontSize: 14, fontWeight: 800, color: stats.pnl >= 0 ? PAL.green : PAL.red }}>{stats.pnl >= 0 ? "+" : ""}${stats.pnl.toFixed(2)}</div>
+                      <div style={{ fontSize: 11, color: PAL.dim, marginTop: 4 }}>{stats.wins}W - {stats.losses}L · {(stats.wins + stats.losses > 0 ? stats.wins / (stats.wins + stats.losses) * 100 : 0).toFixed(0)}%</div>
                     </div>
                   ))}
                 </div>
-              </div>
-
-              {/* Calibration */}
-              {botState.calibration?.totalPredictions > 0 && (
-                <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}`, marginBottom: 16 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>Calibration</div>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
-                    <NumCard label="Total Predictions" value={botState.calibration.totalPredictions} color={PAL.text} />
-                    <NumCard label="Accuracy" value={`${(botState.calibration.correctPredictions / botState.calibration.totalPredictions * 100).toFixed(1)}%`} color={botState.calibration.correctPredictions / botState.calibration.totalPredictions > 0.55 ? PAL.green : PAL.yellow} />
-                  </div>
-                  {Object.keys(botState.calibration.bins || {}).length > 0 && (
-                    <div style={{ marginTop: 10 }}>
-                      <ResponsiveContainer width="100%" height={140}>
-                        <BarChart data={Object.entries(botState.calibration.bins).map(([bin, d]) => ({ bin, actual: +(d.wins / d.total * 100).toFixed(0), n: d.total }))}>
-                          <CartesianGrid strokeDasharray="3 3" stroke={PAL.faint} />
-                          <XAxis dataKey="bin" tick={{ fontSize: 9, fill: PAL.dim }} />
-                          <YAxis tick={{ fontSize: 9, fill: PAL.dim }} domain={[0, 100]} tickFormatter={v => `${v}%`} />
-                          <Tooltip contentStyle={{ background: PAL.card, border: `1px solid ${PAL.border}`, borderRadius: 6, fontSize: 12 }} />
-                          <Bar dataKey="actual" radius={[3, 3, 0, 0]}>
-                            {Object.entries(botState.calibration.bins).map(([bin], i) => (
-                              <Cell key={i} fill={PAL.purple} />
-                            ))}
-                          </Bar>
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  )}
-                </div>
               )}
+
+              {/* Model Weights + Calibration Row */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+                <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}` }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>Model Weights</div>
+                  <div style={{ display: "flex", gap: 16 }}>
+                    {Object.entries(botState.modelWeights || {}).filter(([k]) => k !== "formN").map(([k, v]) => (
+                      <div key={k} style={{ flex: 1 }}>
+                        <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4, textTransform: "capitalize" }}>{k}</div>
+                        <div style={{ height: 6, background: PAL.bg, borderRadius: 3, overflow: "hidden" }}>
+                          <div style={{ width: `${v * 100}%`, height: "100%", background: k === "form" ? PAL.orange : k === "overall" ? PAL.blue : PAL.purple, borderRadius: 3 }} />
+                        </div>
+                        <div style={{ fontSize: 12, fontWeight: 700, marginTop: 4, color: PAL.text }}>{(v * 100).toFixed(0)}%</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {botState.calibration?.totalPredictions > 0 ? (
+                  <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}` }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: PAL.sub }}>Calibration</div>
+                    <div style={{ display: "flex", gap: 16 }}>
+                      <div>
+                        <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 2 }}>Predictions</div>
+                        <div style={{ fontSize: 18, fontWeight: 800 }}>{botState.calibration.totalPredictions}</div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 2 }}>Accuracy</div>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: botState.calibration.correctPredictions / botState.calibration.totalPredictions > 0.5 ? PAL.green : PAL.red }}>
+                          {(botState.calibration.correctPredictions / botState.calibration.totalPredictions * 100).toFixed(0)}%
+                        </div>
+                      </div>
+                    </div>
+                    {Object.keys(botState.calibration.bins || {}).length > 0 && (
+                      <div style={{ marginTop: 8 }}>
+                        <ResponsiveContainer width="100%" height={80}>
+                          <BarChart data={Object.entries(botState.calibration.bins).map(([bin, d]) => ({ bin, actual: +(d.wins / d.total * 100).toFixed(0) }))}>
+                            <XAxis dataKey="bin" tick={{ fontSize: 8, fill: PAL.dim }} />
+                            <Bar dataKey="actual" radius={[3, 3, 0, 0]}>
+                              {Object.entries(botState.calibration.bins).map(([, ], i) => (
+                                <Cell key={i} fill={PAL.purple} />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}`, display: "flex", alignItems: "center", justifyContent: "center", color: PAL.dim, fontSize: 12 }}>
+                    Calibration data builds after 10+ resolved bets
+                  </div>
+                )}
+              </div>
 
               {/* Open Positions */}
               <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Open Positions ({botState.openPositions?.length || 0})</div>
-                {(!botState.openPositions || botState.openPositions.length === 0) ? (
+                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Open Positions ({open.length})</div>
+                {open.length === 0 ? (
                   <div style={{ padding: 24, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
-                    No open positions. Bot will find edge on next run.
+                    No open positions. Bot scans every 5 minutes for new opportunities.
                   </div>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                    {botState.openPositions.map(p => (
-                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 70px 90px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${PAL.yellow}`, alignItems: "center", gap: 8, fontSize: 13 }}>
+                    {open.map(p => (
+                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 60px 80px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${PAL.yellow}`, alignItems: "center", gap: 8, fontSize: 13 }}>
                         <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
                         <div>
                           <div style={{ fontWeight: 600 }}>{p.pick}</div>
-                          <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{" · "}{p.league}</div>
+                          <div style={{ fontSize: 11, color: PAL.dim }}>{p.event} · {p.league}{p.format > 1 ? ` · BO${p.format}` : ""}</div>
                         </div>
                         <div style={{ textAlign: "center" }}>
                           <div style={{ fontSize: 12, fontWeight: 700 }}>{p.ourProb}%</div>
@@ -979,6 +1084,9 @@ export default function App() {
                           {new Date(p.matchTime).toLocaleDateString(undefined, { month: "short", day: "numeric" })}{" "}
                           {new Date(p.matchTime).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
                         </div>
+                        <div style={{ textAlign: "center" }}>
+                          {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -988,28 +1096,28 @@ export default function App() {
               {/* Trade History */}
               <div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700 }}>Trade History ({botState.closedPositions?.length || 0})</div>
-                  {botState.closedPositions?.length > 0 && (
+                  <div style={{ fontSize: 14, fontWeight: 700 }}>Trade History ({closed.length})</div>
+                  {closed.length > 0 && (
                     <div style={{ fontSize: 11, color: PAL.dim }}>
-                      {(() => { const cl = botState.closedPositions || []; const totalPnl = cl.reduce((s, p) => s + (p.pnl || 0), 0); return `Total P&L: `; })()}
-                      <span style={{ fontWeight: 700, color: (botState.closedPositions || []).reduce((s, p) => s + (p.pnl || 0), 0) >= 0 ? PAL.green : PAL.red }}>
-                        {(botState.closedPositions || []).reduce((s, p) => s + (p.pnl || 0), 0) >= 0 ? "+" : ""}${(botState.closedPositions || []).reduce((s, p) => s + (p.pnl || 0), 0).toFixed(2)}
+                      Total P&L:{" "}
+                      <span style={{ fontWeight: 700, color: totalPnl >= 0 ? PAL.green : PAL.red }}>
+                        {totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)}
                       </span>
                     </div>
                   )}
                 </div>
-                {(!botState.closedPositions || botState.closedPositions.length === 0) ? (
+                {closed.length === 0 ? (
                   <div style={{ padding: 24, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
                     No resolved bets yet. The bot will auto-resolve when matches finish.
                   </div>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                     {/* Header row */}
-                    <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 60px 60px 54px 54px 60px 80px", padding: "6px 14px", fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.05em" }}>
-                      <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>MARKET</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span style={{ textAlign: "right" }}>DATE</span>
+                    <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 70px 32px", padding: "6px 14px", fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.05em" }}>
+                      <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>MKT</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span style={{ textAlign: "right" }}>DATE</span><span></span>
                     </div>
-                    {botState.closedPositions.map(p => (
-                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "46px 1fr 60px 60px 54px 54px 60px 80px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
+                    {closed.map(p => (
+                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 70px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
                         <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
                         <div>
                           <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
@@ -1028,6 +1136,9 @@ export default function App() {
                         <div style={{ fontSize: 10, color: PAL.dim, textAlign: "right" }}>
                           {p.resolvedAt ? new Date(p.resolvedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : p.placedAt ? new Date(p.placedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : ""}
                         </div>
+                        <div style={{ textAlign: "center" }}>
+                          {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1037,11 +1148,12 @@ export default function App() {
               {/* Last Run Info */}
               {botState.lastRunAt && (
                 <div style={{ marginTop: 16, fontSize: 11, color: PAL.dim, textAlign: "center" }}>
-                  Last run: {new Date(botState.lastRunAt).toLocaleString()}{" · "}
+                  Last run: {new Date(botState.lastRunAt).toLocaleString()} · Next scan in ~5 min ·{" "}
                   <button onClick={() => { setBotSecret(""); setBotSecretInput(""); setBotUrl(""); setBotUrlInput(""); save("botSecret", ""); save("botUrl", ""); setBotState(null); }} style={{ background: "none", border: "none", color: PAL.red, cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>Disconnect</button>
                 </div>
               )}
-            </>)}
+            </>);
+            })()}
           </>)}
 
           {/* ─── BET LOG VIEW ─── */}
