@@ -28,7 +28,7 @@ const originalLosses = [
     betSize: 20, betPercent: 2.0, confidence: "medium",
     event: "Keyd vs CRASH", league: "CCT South America", format: 3,
     placedAt: "2025-04-07T02:00:00.000Z", matchTime: "2025-04-07T03:00:00.000Z",
-    result: "loss", pnl: -20, resolvedAt: "2025-04-07T06:00:00.000Z",
+    result: "loss", pnl: -57.72, resolvedAt: "2025-04-07T06:00:00.000Z",
   },
   {
     id: "bet_orig_2", matchId: 1421626, game: "csgo",
@@ -38,7 +38,7 @@ const originalLosses = [
     betSize: 10, betPercent: 1.0, confidence: "low",
     event: "ZOMB vs LAG", league: "CCT South America", format: 3,
     placedAt: "2025-04-07T02:00:00.000Z", matchTime: "2025-04-07T04:00:00.000Z",
-    result: "loss", pnl: -10, resolvedAt: "2025-04-07T07:00:00.000Z",
+    result: "loss", pnl: -51.44, resolvedAt: "2025-04-07T07:00:00.000Z",
   },
   {
     id: "bet_orig_3", matchId: 1431971, game: "csgo",
@@ -48,7 +48,7 @@ const originalLosses = [
     betSize: 15, betPercent: 1.5, confidence: "medium",
     event: "REGAIN vs InC", league: "CCT South America", format: 3,
     placedAt: "2025-04-07T02:00:00.000Z", matchTime: "2025-04-07T05:00:00.000Z",
-    result: "loss", pnl: -15, resolvedAt: "2025-04-07T08:00:00.000Z",
+    result: "loss", pnl: -47.00, resolvedAt: "2025-04-07T08:00:00.000Z",
   },
 ];
 
@@ -60,8 +60,8 @@ for (const loss of originalLosses) {
   }
 }
 
-// Adjust bankroll to reflect the losses
-state.bankroll = 1000 - 45; // $1000 - $45 total losses = $955
+// Adjust bankroll to reflect the 3 original losses (-$156.16)
+state.bankroll = 1000 - 156.16; // $1000 - $156.16 = $843.84
 state.initialBankroll = 1000;
 
 // Update calibration
@@ -69,5 +69,5 @@ state.calibration.totalPredictions = (state.calibration.totalPredictions || 0) +
 // All 3 were losses, so no correctPredictions added
 
 writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-console.log("✅ Restored 0-3 record. Bankroll: $955. State saved.");
+console.log("✅ Restored 0-3 record. Bankroll: $843.84. State saved.");
 console.log("Closed positions:", state.closedPositions.length);
