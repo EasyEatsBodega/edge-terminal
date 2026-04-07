@@ -284,8 +284,8 @@ async function runBot() {
 
     const now = new Date();
 
-    // 2. Resolve completed matches
-    const toResolve = state.openPositions.filter(p => new Date(p.matchTime) < new Date(now - 3600000));
+    // 2. Resolve completed matches (check 30min after match start)
+    const toResolve = state.openPositions.filter(p => new Date(p.matchTime) < new Date(now - 1800000));
     const stillOpen = [];
     let resolvedCount = 0;
 
@@ -391,12 +391,14 @@ async function runBot() {
 
           const pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights);
 
-          const edgeA = pred.probA - opp.polyOdds.probA;
-          const edgeB = pred.probB - opp.polyOdds.probB;
-          const pickSide = edgeA > edgeB ? "A" : "B";
-          const edge = pickSide === "A" ? edgeA : edgeB;
+          // Only bet on the team we think WINS (>50%) where market undervalues them
+          const pickSide = pred.probA >= pred.probB ? "A" : "B";
+          const ourProb = pickSide === "A" ? pred.probA : pred.probB;
+          const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
+          const edge = ourProb - marketProb;
 
-          if (edge < MIN_EDGE) continue;
+          if (ourProb < 52) continue;    // Must believe team wins convincingly
+          if (edge < MIN_EDGE) continue;  // Must have real edge vs market
           if (pred.confidence === "low" && edge < 8) continue;
 
           const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);

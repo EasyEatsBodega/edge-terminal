@@ -285,7 +285,7 @@ export default async function handler(req, res) {
     const now = new Date();
 
     // 2. Resolve completed matches
-    const toResolve = state.openPositions.filter(p => new Date(p.matchTime) < new Date(now - 3600000)); // Match started > 1hr ago
+    const toResolve = state.openPositions.filter(p => new Date(p.matchTime) < new Date(now - 1800000)); // Match started > 30min ago
     const stillOpen = [];
     let resolvedCount = 0;
 
@@ -401,15 +401,15 @@ export default async function handler(req, res) {
 
           const pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights);
 
-          // Calculate edge
-          const edgeA = pred.probA - opp.polyOdds.probA;
-          const edgeB = pred.probB - opp.polyOdds.probB;
-          const bestEdge = Math.abs(edgeA) > Math.abs(edgeB) ? edgeA : -edgeB;
-          const pickSide = edgeA > edgeB ? "A" : "B";
-          const edge = pickSide === "A" ? edgeA : edgeB;
+          // Only bet on the team we think WINS (>50%) where market undervalues them
+          const pickSide = pred.probA >= pred.probB ? "A" : "B";
+          const ourProb = pickSide === "A" ? pred.probA : pred.probB;
+          const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
+          const edge = ourProb - marketProb;
 
-          if (edge < MIN_EDGE) continue;
-          if (pred.confidence === "low" && edge < 8) continue; // Need higher edge for low confidence
+          if (ourProb < 52) continue;    // Must believe team wins convincingly
+          if (edge < MIN_EDGE) continue;  // Must have real edge vs market
+          if (pred.confidence === "low" && edge < 8) continue;
 
           const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
           const betSize = calcBetSize(edge, state.bankroll, pred.confidence);
