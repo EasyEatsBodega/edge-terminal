@@ -285,6 +285,9 @@ async function runBot() {
     const now = new Date();
 
     // 2. Resolve completed matches (check 30min after match start)
+    // Fetch Polymarket data once for resolution fallback + live prices
+    const polyMarketsForResolve = await fetchAllPolymarketEsports();
+
     const toResolve = state.openPositions.filter(p => new Date(p.matchTime) < new Date(now - 1800000));
     const stillOpen = [];
     let resolvedCount = 0;
@@ -292,37 +295,53 @@ async function runBot() {
     for (const pos of state.openPositions) {
       if (!toResolve.includes(pos)) { stillOpen.push(pos); continue; }
 
+      let won = null;
+
+      // Try PandaScore first
       try {
         const match = await pandaFetch(`matches/${pos.matchId}`);
         if ((match.status === "finished" || match.status === "canceled") && match.winner) {
-          const won = (pos.pickSide === "A" && match.winner.id === pos.teamAId) ||
-                      (pos.pickSide === "B" && match.winner.id === pos.teamBId);
-
-          const result = won ? "win" : "loss";
-          const pnl = won ? pos.betSize * ((100 / pos.marketProb) - 1) : -pos.betSize;
-
-          if (won) state.bankroll += pos.betSize + pnl;
-
-          const closed = { ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString() };
-          state.closedPositions.unshift(closed);
-          resolvedCount++;
-
-          const bin = `${Math.floor(pos.ourProb / 5) * 5}-${Math.floor(pos.ourProb / 5) * 5 + 5}`;
-          if (!state.calibration.bins[bin]) state.calibration.bins[bin] = { total: 0, wins: 0 };
-          state.calibration.bins[bin].total++;
-          if (won) state.calibration.bins[bin].wins++;
-          state.calibration.totalPredictions++;
-          if (won) state.calibration.correctPredictions++;
-
-          const emoji = won ? "✅" : "❌";
-          push(`${emoji} Resolved: ${pos.pick} (${pos.event}) → ${result} | P&L: $${pnl.toFixed(2)}`);
-          await sendTG(`${emoji} <b>BET RESOLVED</b>\n\n${pos.event}\nPick: <b>${pos.pick}</b>\nResult: <b>${result.toUpperCase()}</b>\nP&L: <b>$${pnl.toFixed(2)}</b>\nBankroll: <b>$${state.bankroll.toFixed(2)}</b>`);
-        } else {
-          stillOpen.push(pos);
+          won = (pos.pickSide === "A" && match.winner.id === pos.teamAId) ||
+                (pos.pickSide === "B" && match.winner.id === pos.teamBId);
         }
       } catch (e) {
+        push(`⚠️ PandaScore check failed for ${pos.event}: ${e.message}`);
+      }
+
+      // Fallback: check Polymarket — if market resolved (price at 0 or 100), determine winner
+      if (won === null) {
+        const polyOdds = matchPolymarket(polyMarketsForResolve, pos.teamA, pos.teamB);
+        if (polyOdds) {
+          const pickProb = pos.pickSide === "A" ? polyOdds.probA : polyOdds.probB;
+          // Market resolved: price near 100 = our pick won, near 0 = lost
+          if (pickProb >= 95) won = true;
+          else if (pickProb <= 5) won = false;
+          if (won !== null) push(`📡 Resolved via Polymarket: ${pos.event}`);
+        }
+      }
+
+      if (won !== null) {
+        const result = won ? "win" : "loss";
+        const pnl = won ? pos.betSize * ((100 / pos.marketProb) - 1) : -pos.betSize;
+
+        if (won) state.bankroll += pos.betSize + pnl;
+
+        const closed = { ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString() };
+        state.closedPositions.unshift(closed);
+        resolvedCount++;
+
+        const bin = `${Math.floor(pos.ourProb / 5) * 5}-${Math.floor(pos.ourProb / 5) * 5 + 5}`;
+        if (!state.calibration.bins[bin]) state.calibration.bins[bin] = { total: 0, wins: 0 };
+        state.calibration.bins[bin].total++;
+        if (won) state.calibration.bins[bin].wins++;
+        state.calibration.totalPredictions++;
+        if (won) state.calibration.correctPredictions++;
+
+        const emoji = won ? "✅" : "❌";
+        push(`${emoji} Resolved: ${pos.pick} (${pos.event}) → ${result} | P&L: $${pnl.toFixed(2)}`);
+        await sendTG(`${emoji} <b>BET RESOLVED</b>\n\n${pos.event}\nPick: <b>${pos.pick}</b>\nResult: <b>${result.toUpperCase()}</b>\nP&L: <b>$${pnl.toFixed(2)}</b>\nBankroll: <b>$${state.bankroll.toFixed(2)}</b>`);
+      } else {
         stillOpen.push(pos);
-        push(`⚠️ Couldn't check match ${pos.matchId}: ${e.message}`);
       }
     }
     state.openPositions = stillOpen;
@@ -570,20 +589,66 @@ async function handleTelegramCommand(text) {
     const open = state.openPositions || [];
     if (open.length === 0) return "📭 No open trades right now.";
 
+    // Fetch live Polymarket prices
+    let polyMarkets = [];
+    try { polyMarkets = await fetchAllPolymarketEsports(); } catch {}
+
     let msg = `📊 <b>OPEN TRADES (${open.length})</b>\n`;
     const deployed = open.reduce((s, p) => s + p.betSize, 0);
-    msg += `💰 $${deployed.toFixed(0)} deployed of $${state.bankroll.toFixed(0)} bankroll\n\n`;
+    msg += `💰 $${deployed.toFixed(0)} deployed of $${(state.bankroll + deployed).toFixed(0)} bankroll\n\n`;
 
-    open.forEach((p, i) => {
+    for (let i = 0; i < open.length; i++) {
+      const p = open[i];
       const game = GAME_LABEL[p.game] || p.game;
       const matchDate = new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
       const link = buildPolymarketLink(p.game, p.teamA, p.teamB);
+
+      // Get live Polymarket price for this position
+      const liveOdds = matchPolymarket(polyMarkets, p.teamA, p.teamB);
+      const liveProb = liveOdds ? (p.pickSide === "A" ? liveOdds.probA : liveOdds.probB) : null;
+
+      // Calculate unrealized P&L based on current market price vs entry
+      let livePnl = null;
+      let livePnlStr = "";
+      if (liveProb !== null) {
+        // If we bought at marketProb and current price is liveProb
+        // P&L = betSize * (liveProb - entryProb) / entryProb
+        livePnl = p.betSize * ((liveProb / p.marketProb) - 1);
+        const sign = livePnl >= 0 ? "+" : "";
+        livePnlStr = `${sign}$${livePnl.toFixed(2)}`;
+      }
+
       msg += `${i + 1}. <b>${game}</b> — ${p.event}\n`;
-      msg += `   Pick: <b>${p.pick}</b> | Edge: +${p.edge}% | $${p.betSize}\n`;
-      msg += `   Model: ${p.ourProb}% vs Market: ${p.marketProb}%\n`;
+      msg += `   Pick: <b>${p.pick}</b> | $${p.betSize} bet\n`;
+      msg += `   Entry: ${p.marketProb}%`;
+      if (liveProb !== null) {
+        const arrow = liveProb > p.marketProb ? "📈" : liveProb < p.marketProb ? "📉" : "➡️";
+        msg += ` → Now: <b>${liveProb.toFixed(1)}%</b> ${arrow}`;
+      }
+      msg += `\n`;
+      msg += `   Model: ${p.ourProb}% | Edge: +${p.edge}%\n`;
+      if (livePnlStr) msg += `   Live P&L: <b>${livePnlStr}</b>\n`;
       msg += `   ${p.league} · BO${p.format} · ${matchDate} UTC\n`;
       msg += `   🔗 <a href="${link}">Polymarket</a>\n\n`;
-    });
+    }
+
+    // Total unrealized P&L
+    if (polyMarkets.length > 0) {
+      let totalLivePnl = 0;
+      let counted = 0;
+      for (const p of open) {
+        const lo = matchPolymarket(polyMarkets, p.teamA, p.teamB);
+        if (lo) {
+          const lp = p.pickSide === "A" ? lo.probA : lo.probB;
+          totalLivePnl += p.betSize * ((lp / p.marketProb) - 1);
+          counted++;
+        }
+      }
+      if (counted > 0) {
+        const sign = totalLivePnl >= 0 ? "+" : "";
+        msg += `💹 <b>Total Unrealized: ${sign}$${totalLivePnl.toFixed(2)}</b>`;
+      }
+    }
 
     return msg;
   }
