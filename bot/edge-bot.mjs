@@ -522,17 +522,25 @@ function adjustWeights(state) {
   return weights;
 }
 
-// Circuit breaker — should we stop betting entirely?
+// Circuit breaker — should we stop placing EDGE bets?
+// Does NOT affect confirmation bets (those ride the market, not against it).
+// Only looks at trades from the last 7 days to avoid penalizing new model for old bugs.
 function shouldCircuitBreak(state) {
   const closed = state.closedPositions || [];
   if (closed.length < 4) return false;
 
-  const recent = closed.slice(0, 10);
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  const recent = closed
+    .filter(p => (p.resolvedAt || p.placedAt) > sevenDaysAgo)
+    .slice(0, 10);
+
+  if (recent.length < 4) return false;  // Not enough recent data to judge
+
   const wins = recent.filter(p => p.result === "win").length;
   const hitRate = wins / recent.length;
 
-  // If win rate is below 20% over last 10, stop
-  if (recent.length >= 6 && hitRate < 0.20) return true;
+  // If win rate is below 20% over recent trades, pause edge bets
+  if (hitRate < 0.20) return true;
 
   return false;
 }
@@ -655,23 +663,32 @@ async function runBot() {
 
     if (dd.halted) {
       push(`🛑 HALTED — Bankroll at ${dd.bankrollPct.toFixed(1)}% of initial (below ${DRAWDOWN_HALT_PCT}%). No new bets until manual review.`);
-      await sendTG(`🛑 <b>BOT HALTED</b>\n\nBankroll dropped to <b>${dd.bankrollPct.toFixed(1)}%</b> of initial.\nNo new bets will be placed.\nUse /reset or manually adjust to resume.`);
+      if (!state.haltAlertSent) {
+        await sendTG(`🛑 <b>BOT HALTED</b>\n\nBankroll dropped to <b>${dd.bankrollPct.toFixed(1)}%</b> of initial.\nNo new bets will be placed.\nUse /reset or manually adjust to resume.`);
+        state.haltAlertSent = true;
+      }
       saveState(state);
       return { ok: true, log };
+    } else {
+      state.haltAlertSent = false;
     }
 
-    if (shouldCircuitBreak(state)) {
-      push(`⚡ CIRCUIT BREAKER — Win rate too low. Pausing new bets.`);
-      await sendTG(`⚡ <b>CIRCUIT BREAKER</b>\n\nWin rate critically low over recent trades.\nPausing new bets until performance improves.`);
-      saveState(state);
-      return { ok: true, log };
+    const circuitBroken = shouldCircuitBreak(state);
+    if (circuitBroken) {
+      push(`⚡ CIRCUIT BREAKER — Edge bets paused (win rate too low). Confirmation bets still active.`);
+      if (!state.circuitBreakerAlertSent) {
+        await sendTG(`⚡ <b>CIRCUIT BREAKER</b>\n\nEdge bet win rate too low — pausing edge bets.\nConfirmation bets (heavy favorites) still active.\n\n<i>This alert won't repeat — use /status to check.</i>`);
+        state.circuitBreakerAlertSent = true;
+      }
+    } else {
+      state.circuitBreakerAlertSent = false;
     }
 
     // Track cooldown after loss streaks
     if (dd.consecLosses >= MAX_CONSEC_LOSSES) {
       state.runsSinceLossStreak = (state.runsSinceLossStreak || 0) + 1;
       if (dd.onCooldown) {
-        push(`❄️ COOLDOWN — ${dd.consecLosses} consecutive losses. Skipping ${COOLDOWN_AFTER_LOSS_STREAK - state.runsSinceLossStreak + 1} more runs.`);
+        push(`❄️ COOLDOWN — ${dd.consecLosses} consecutive losses. Skipping this run.`);
         saveState(state);
         return { ok: true, log };
       }
@@ -741,8 +758,9 @@ async function runBot() {
 
       push(`🎯 ${opportunities.length} quality matches (skipped ${skippedLowLiq} low-liquidity/no-edge markets)`);
 
-      // Analyze ALL matched opportunities, not just first 8
+      // Analyze ALL matched opportunities — needed for both edge + confirmation bets
       const analyzed = [];
+      const allPredictions = [];  // Store all predictions for confirmation bet scan
 
       for (const opp of opportunities) {
         try {
@@ -758,9 +776,13 @@ async function runBot() {
           const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
           const edge = ourProb - marketProb;
 
-          if (ourProb < MIN_OUR_PROB) continue;   // Must believe team wins (60%+)
-          if (edge < MIN_EDGE) continue;           // Must have 5%+ edge vs market
-          if (pred.confidence === "low" && ourProb < 65) continue;  // Low data? Need strong conviction
+          allPredictions.push({ opp, pred, pickSide, ourProb, marketProb, edge });
+
+          // Edge bet filters — only if circuit breaker is NOT active
+          if (circuitBroken) continue;
+          if (ourProb < MIN_OUR_PROB) continue;
+          if (edge < MIN_EDGE) continue;
+          if (pred.confidence === "low" && ourProb < 65) continue;
 
           analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
         } catch (e) {
@@ -852,51 +874,34 @@ async function runBot() {
       }
 
       // ─── Market Confirmation Bets ───────────────────────────────────────
-      // When model AND market both agree on a heavy favorite, take a small position.
-      // Thesis: esports markets slightly underprice favorites because degen bettors
-      // love underdogs. If our model confirms the market's heavy favorite, the true
-      // probability is likely even higher than quoted.
+      // When model AND market both agree on a heavy favorite, take a position.
+      // These BYPASS the circuit breaker — we're riding the market, not fighting it.
+      // Thesis: esports markets slightly underprice favorites (degen bettors love underdogs).
       if (CONFIRM_ENABLED && state.openPositions.length < MAX_POSITIONS) {
         let confirmBets = 0;
 
-        for (const opp of opportunities) {
+        // Use allPredictions (already computed above) — no extra API calls needed
+        for (const ap of allPredictions) {
           if (confirmBets >= CONFIRM_MAX_PER_RUN) break;
           if (state.openPositions.length >= MAX_POSITIONS) break;
-          if (state.openPositions.some(p => p.matchId === opp.match.id)) continue;
-          if ((opp.polyOdds.liquidity || 0) < CONFIRM_MIN_LIQUIDITY) continue;
+          if (state.openPositions.some(p => p.matchId === ap.opp.match.id)) continue;
+          if ((ap.opp.polyOdds.liquidity || 0) < CONFIRM_MIN_LIQUIDITY) continue;
 
           // Already placed an edge bet on this match?
-          if (betsPlaced.some(b => b.matchId === opp.match.id)) continue;
+          if (betsPlaced.some(b => b.matchId === ap.opp.match.id)) continue;
 
-          // Need to fetch prediction if not already analyzed
-          let pred;
-          const alreadyAnalyzed = analyzed.find(a => a.opp.match.id === opp.match.id);
-          if (alreadyAnalyzed) {
-            pred = alreadyAnalyzed.pred;
-          } else {
-            try {
-              const [histA, histB] = await Promise.all([
-                pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t1.id}&per_page=25&sort=-scheduled_at`),
-                pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t2.id}&per_page=25&sort=-scheduled_at`),
-              ]);
-              pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights);
-            } catch { continue; }
-          }
-
-          const pickSide = pred.probA >= pred.probB ? "A" : "B";
-          const ourProb = pickSide === "A" ? pred.probA : pred.probB;
-          const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
+          const { pred, pickSide, ourProb, marketProb } = ap;
 
           // Both model and market must agree this is a heavy favorite
           if (marketProb < CONFIRM_MIN_MARKET_PROB) continue;
           if (ourProb < CONFIRM_MIN_OUR_PROB) continue;
           if (pred.confidence === "low") continue;  // Need decent data
 
-          // Tiny bet — grinding, not swinging
           const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * CONFIRM_MAX_BET_PCT / 100));
           const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
           if (confirmSize > state.bankroll - currentDeployed) continue;
 
+          const opp = ap.opp;
           const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
           const edge = ourProb - marketProb;
 
