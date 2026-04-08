@@ -31,17 +31,24 @@ const CFG = loadConfig();
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INITIAL_BANKROLL = 1000;
-const MAX_DEPLOYED_PCT = 40;         // Deploy more capital — we're taking high-prob picks
-const MAX_POSITIONS = 10;
-const MIN_EDGE = 3;                  // Lower edge threshold — if we're 65%+ confident, 3% edge is fine
-const MAX_BET_PCT = 10;              // Bigger bets on high-confidence plays
-const MIN_BET = 10;
-const BET_WINDOW_MIN_H = 0.25;
-const BET_WINDOW_MAX_H = 12;         // Wider window — more games to pick from
-const MIN_LIQUIDITY = 500;           // Lower liq floor — more markets available
-const MIN_OUR_PROB = 60;             // Only bet when model says 60%+ to WIN — high likelihood plays
-const BETS_PER_RUN = 5;              // Take up to 5 plays per run — more action
-const HIGH_CONF_PROB = 70;           // 70%+ model probability = size up aggressively
+const MAX_DEPLOYED_PCT = 20;         // Conservative — protect remaining bankroll
+const MAX_POSITIONS = 5;             // Fewer concurrent bets = less correlated risk
+const MIN_EDGE = 5;                  // Need real edge vs market, not 3% noise
+const MAX_BET_PCT = 5;               // Smaller max bet — survival first
+const MIN_BET = 5;
+const BET_WINDOW_MIN_H = 0.5;       // 30min minimum — need settled odds
+const BET_WINDOW_MAX_H = 6;          // Tighter window — odds more reliable closer to match
+const MIN_LIQUIDITY = 2000;          // Real liquidity only — thin markets = bad prices
+const MIN_OUR_PROB = 60;             // Keep — only bet confident picks
+const BETS_PER_RUN = 2;              // Quality over quantity — max 2 bets per run
+const PRICE_DISCOVERY_MIN = 58;      // Market must show some signal (not coin-flip territory)
+
+// ─── Drawdown Protection ───────────────────────────────────────────────────
+
+const DRAWDOWN_HALT_PCT = 50;        // Stop betting if bankroll drops below 50% of initial
+const DRAWDOWN_SURVIVAL_PCT = 70;    // Enter survival mode below 70% (half sizing)
+const MAX_CONSEC_LOSSES = 3;         // After 3 consecutive losses, halve sizing
+const COOLDOWN_AFTER_LOSS_STREAK = 2; // Skip N runs after hitting loss streak limit
 
 // ─── File-Based State ───────────────────────────────────────────────────────
 
@@ -240,8 +247,8 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 
   // BO format adjustment — BO1 is volatile, BO3+ rewards better team
   const bo = format || 1;
-  if (bo === 1) prob = prob * 0.82 + 50 * 0.18;  // Stronger pull to 50% for BO1
-  else if (bo >= 5) prob = 50 + (prob - 50) * 1.12;
+  if (bo === 1) prob = prob * 0.75 + 50 * 0.25;  // Strong pull to 50% for BO1 — upsets are real
+  else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;  // Slight amplification for long series
 
   prob = Math.max(5, Math.min(95, prob));
   const confidence = Math.min(rA.length, rB.length) >= 8 ? "high" : Math.min(rA.length, rB.length) >= 4 ? "medium" : "low";
@@ -310,24 +317,59 @@ function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA,
   return parts.join(". ") + ".";
 }
 
+// ─── Drawdown Detection ────────────────────────────────────────────────────
+
+function getDrawdownState(state) {
+  const bankrollPct = (state.bankroll / state.initialBankroll) * 100;
+  const closed = state.closedPositions || [];
+
+  // Count consecutive losses from most recent
+  let consecLosses = 0;
+  for (const p of closed) {
+    if (p.result === "loss") consecLosses++;
+    else break;
+  }
+
+  // Check if we should halt entirely
+  const halted = bankrollPct <= DRAWDOWN_HALT_PCT;
+
+  // Check if we're in survival mode
+  const survival = bankrollPct <= DRAWDOWN_SURVIVAL_PCT;
+
+  // Check if on a bad loss streak — apply cooldown
+  const onCooldown = consecLosses >= MAX_CONSEC_LOSSES &&
+    state.runsSinceLossStreak !== undefined &&
+    state.runsSinceLossStreak < COOLDOWN_AFTER_LOSS_STREAK;
+
+  // Sizing multiplier based on drawdown
+  let sizeMult = 1.0;
+  if (survival) sizeMult = 0.5;                     // Half size in survival mode
+  if (consecLosses >= MAX_CONSEC_LOSSES) sizeMult *= 0.5;  // Half again on loss streak
+
+  return { bankrollPct, consecLosses, halted, survival, onCooldown, sizeMult };
+}
+
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
 
-function calcBetSize(edge, bankroll, confidence, format = 3, ourProb = 50) {
+function calcBetSize(edge, bankroll, confidence, format = 3, drawdownMult = 1.0) {
+  // Quarter-Kelly base — conservative fractional Kelly
   const kellyFull = edge / 100 * bankroll;
-  let fraction;
-  if (edge >= 8) fraction = 1.0;
-  else if (edge >= 5) fraction = 0.75;
-  else fraction = 0.5;
+  let fraction = 0.25;
 
-  if (confidence === "low") fraction *= 0.5;
-  else if (confidence === "medium") fraction *= 0.75;
+  // Scale up slightly for strong edges, but cap conservatively
+  if (edge >= 10) fraction = 0.5;
+  else if (edge >= 7) fraction = 0.4;
+  else if (edge >= 5) fraction = 0.3;
 
-  // HIGH PROBABILITY BOOST — if model is 70%+ confident, size up
-  if (ourProb >= HIGH_CONF_PROB) fraction *= 1.5;
-  else if (ourProb >= 65) fraction *= 1.2;
+  // Confidence penalty — less data = smaller bets
+  if (confidence === "low") fraction *= 0.4;
+  else if (confidence === "medium") fraction *= 0.7;
 
-  // BO1 penalty — reduce bet size due to high variance
-  if (format === 1) fraction *= 0.6;  // Less harsh than before (was 0.5)
+  // BO1 penalty — high variance format
+  if (format === 1) fraction *= 0.5;
+
+  // Apply drawdown multiplier (from getDrawdownState)
+  fraction *= drawdownMult;
 
   let size = Math.round(kellyFull * fraction);
   size = Math.max(MIN_BET, size);
@@ -339,31 +381,34 @@ function calcBetSize(edge, bankroll, confidence, format = 3, ourProb = 50) {
 
 function adjustWeights(state) {
   const closed = state.closedPositions || [];
-  if (closed.length < 10) return state.modelWeights;
+  if (closed.length < 4) return state.modelWeights;  // Start adjusting after just 4 trades
 
-  const recent = closed.slice(0, 30);
-  let overconfident = 0;
-
-  recent.forEach(p => {
-    const predicted = p.pickSide === "A" ? p.ourProb : 100 - p.ourProb;
-    if (predicted > 60 && p.result === "loss") overconfident++;
-  });
-
+  const recent = closed.slice(0, 20);
   const total = recent.length;
   const wins = recent.filter(p => p.result === "win").length;
-  const actualHitRate = wins / total;
+  const losses = total - wins;
+  const hitRate = wins / total;
   const weights = { ...state.modelWeights };
 
-  if (overconfident / total > 0.3) {
-    weights.form = Math.max(0.25, weights.form - 0.03);
-    weights.overall = Math.min(0.45, weights.overall + 0.02);
-    weights.h2h = Math.min(0.25, weights.h2h + 0.01);
+  // Count overconfident losses (model said 60%+ but lost)
+  let overconfident = 0;
+  recent.forEach(p => {
+    if (p.ourProb > 55 && p.result === "loss") overconfident++;
+  });
+
+  // If more than 25% of recent picks are overconfident losses, reduce form reliance
+  if (total >= 4 && overconfident / total > 0.25) {
+    weights.form = Math.max(0.20, weights.form - 0.05);
+    weights.overall = Math.min(0.50, weights.overall + 0.03);
+    weights.h2h = Math.min(0.30, weights.h2h + 0.02);
   }
 
-  if (actualHitRate > 0.6) {
-    weights.form = Math.min(0.55, weights.form + 0.01);
+  // If winning, lean back into form
+  if (hitRate > 0.55 && total >= 6) {
+    weights.form = Math.min(0.55, weights.form + 0.02);
   }
 
+  // Normalize weights to sum to ~0.95 (remaining 0.05 is implicit strength weight)
   const sum = weights.form + weights.overall + weights.h2h;
   if (sum > 0) {
     const scale = 0.95 / sum;
@@ -373,6 +418,21 @@ function adjustWeights(state) {
   }
 
   return weights;
+}
+
+// Circuit breaker — should we stop betting entirely?
+function shouldCircuitBreak(state) {
+  const closed = state.closedPositions || [];
+  if (closed.length < 4) return false;
+
+  const recent = closed.slice(0, 10);
+  const wins = recent.filter(p => p.result === "win").length;
+  const hitRate = wins / recent.length;
+
+  // If win rate is below 20% over last 10, stop
+  if (recent.length >= 6 && hitRate < 0.20) return true;
+
+  return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -480,7 +540,7 @@ async function runBot() {
     }
     state.openPositions = stillOpen;
 
-    if (resolvedCount > 0 && state.closedPositions.length >= 10) {
+    if (resolvedCount > 0 && state.closedPositions.length >= 4) {
       const newWeights = adjustWeights(state);
       if (JSON.stringify(newWeights) !== JSON.stringify(state.modelWeights)) {
         push(`🧠 Model weights adjusted: form=${newWeights.form.toFixed(2)} overall=${newWeights.overall.toFixed(2)} h2h=${newWeights.h2h.toFixed(2)}`);
@@ -488,16 +548,51 @@ async function runBot() {
       }
     }
 
+    // ─── Drawdown & Circuit Breaker Checks ────────────────────────────────
+    const dd = getDrawdownState(state);
+
+    if (dd.halted) {
+      push(`🛑 HALTED — Bankroll at ${dd.bankrollPct.toFixed(1)}% of initial (below ${DRAWDOWN_HALT_PCT}%). No new bets until manual review.`);
+      await sendTG(`🛑 <b>BOT HALTED</b>\n\nBankroll dropped to <b>${dd.bankrollPct.toFixed(1)}%</b> of initial.\nNo new bets will be placed.\nUse /reset or manually adjust to resume.`);
+      saveState(state);
+      return { ok: true, log };
+    }
+
+    if (shouldCircuitBreak(state)) {
+      push(`⚡ CIRCUIT BREAKER — Win rate too low. Pausing new bets.`);
+      await sendTG(`⚡ <b>CIRCUIT BREAKER</b>\n\nWin rate critically low over recent trades.\nPausing new bets until performance improves.`);
+      saveState(state);
+      return { ok: true, log };
+    }
+
+    // Track cooldown after loss streaks
+    if (dd.consecLosses >= MAX_CONSEC_LOSSES) {
+      state.runsSinceLossStreak = (state.runsSinceLossStreak || 0) + 1;
+      if (dd.onCooldown) {
+        push(`❄️ COOLDOWN — ${dd.consecLosses} consecutive losses. Skipping ${COOLDOWN_AFTER_LOSS_STREAK - state.runsSinceLossStreak + 1} more runs.`);
+        saveState(state);
+        return { ok: true, log };
+      }
+    } else {
+      state.runsSinceLossStreak = 0;
+    }
+
+    if (dd.survival) {
+      push(`⚠️ SURVIVAL MODE — Bankroll at ${dd.bankrollPct.toFixed(1)}%. Half sizing active.`);
+    }
+    if (dd.consecLosses >= MAX_CONSEC_LOSSES) {
+      push(`⚠️ LOSS STREAK — ${dd.consecLosses} consecutive losses. Reduced sizing.`);
+    }
+
     // 3. Find new opportunities
     const deployedPct = state.openPositions.reduce((s, p) => s + p.betSize, 0) / state.bankroll * 100;
     const canBet = state.openPositions.length < MAX_POSITIONS && deployedPct < MAX_DEPLOYED_PCT && state.bankroll > MIN_BET;
 
     if (canBet) {
-      // Fetch MORE matches per game to scan wider
       const [csgo, dota2, lol, polyMarkets] = await Promise.all([
-        pandaFetch("csgo/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
-        pandaFetch("dota2/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
-        pandaFetch("lol/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
+        pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
       ]);
 
@@ -532,9 +627,9 @@ async function runBot() {
           continue;
         }
 
-        // FILTER: Skip markets where both sides are dead even (45-55%) — need SOME signal
+        // FILTER: Skip coin-flip markets — need real price discovery signal
         const maxProb = Math.max(polyOdds.probA, polyOdds.probB);
-        if (maxProb < 53) {
+        if (maxProb < PRICE_DISCOVERY_MIN) {
           skippedLowLiq++;
           continue;
         }
@@ -562,7 +657,7 @@ async function runBot() {
           const edge = ourProb - marketProb;
 
           if (ourProb < MIN_OUR_PROB) continue;   // Must believe team wins (60%+)
-          if (edge < MIN_EDGE) continue;           // Must have edge vs market (3%+)
+          if (edge < MIN_EDGE) continue;           // Must have 5%+ edge vs market
           if (pred.confidence === "low" && ourProb < 65) continue;  // Low data? Need strong conviction
 
           analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
@@ -571,15 +666,15 @@ async function runBot() {
         }
       }
 
-      // RANK by win probability (highest first) — we want the BEST chance to WIN
-      analyzed.sort((a, b) => b.ourProb - a.ourProb);
+      // RANK by edge (highest first) — biggest market mispricing = best opportunity
+      analyzed.sort((a, b) => b.edge - a.edge);
 
       if (analyzed.length > 0) {
-        push(`🏆 ${analyzed.length} opportunities pass filters — top picks:`);
+        push(`🏆 ${analyzed.length} opportunities pass filters — ranked by edge:`);
         for (let i = 0; i < Math.min(analyzed.length, 5); i++) {
           const a = analyzed[i];
           const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-          push(`   ${i + 1}. ${pick} (${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}) — Model: ${a.ourProb.toFixed(1)}% | Market: ${a.marketProb.toFixed(1)}% | Edge: +${a.edge.toFixed(1)}% | Liq: $${a.opp.polyOdds.liquidity.toFixed(0)}`);
+          push(`   ${i + 1}. ${pick} (${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}) — Edge: +${a.edge.toFixed(1)}% | Model: ${a.ourProb.toFixed(1)}% | Market: ${a.marketProb.toFixed(1)}% | Liq: $${a.opp.polyOdds.liquidity.toFixed(0)}`);
         }
       } else {
         push("📭 No opportunities pass quality filters this run");
@@ -594,7 +689,7 @@ async function runBot() {
         if (currentDeployed / state.bankroll * 100 >= MAX_DEPLOYED_PCT) break;
 
         const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1, a.ourProb);
+        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1, dd.sizeMult);
 
         if (betSize > state.bankroll - currentDeployed) continue;
 

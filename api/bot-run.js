@@ -4,13 +4,14 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const INITIAL_BANKROLL = 1000;
-const MAX_DEPLOYED_PCT = 20;   // Max % of bankroll deployed at once
-const MAX_POSITIONS = 5;       // Max concurrent open positions
-const MIN_EDGE = 3;            // Min edge % to consider a bet
-const MAX_BET_PCT = 6;         // Max single bet as % of bankroll
-const MIN_BET = 10;            // Minimum bet size $
+const MAX_DEPLOYED_PCT = 20;   // Conservative — protect remaining bankroll
+const MAX_POSITIONS = 5;       // Fewer concurrent bets
+const MIN_EDGE = 5;            // Need real edge vs market
+const MAX_BET_PCT = 5;         // Smaller max bet — survival first
+const MIN_BET = 5;             // Minimum bet size $
 const BET_WINDOW_MIN_H = 0.5;  // Don't bet on matches starting in < 30 min
-const BET_WINDOW_MAX_H = 48;   // Don't bet on matches > 48hr out
+const BET_WINDOW_MAX_H = 6;    // Tighter window — odds more reliable closer to match
+const MIN_LIQUIDITY = 2000;    // Real liquidity only — thin markets = bad prices
 
 // ─── Redis Helpers ───────────────────────────────────────────────────────────
 
@@ -165,7 +166,7 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 
   // BO format adjustment
   const bo = format || 1;
-  if (bo === 1) prob = prob * 0.88 + 50 * 0.12;
+  if (bo === 1) prob = prob * 0.75 + 50 * 0.25;  // Strong pull to 50% for BO1
   else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;
 
   prob = Math.max(5, Math.min(95, prob));
@@ -185,18 +186,19 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 // ─── Bet Sizing ──────────────────────────────────────────────────────────────
 
 function calcBetSize(edge, bankroll, confidence) {
-  const kellyFull = edge / 100 * bankroll; // Simplified Kelly for small edges
-  let fraction;
-  if (edge >= 8) fraction = 1.0;        // Full Kelly
-  else if (edge >= 5) fraction = 0.75;   // 3/4 Kelly
-  else fraction = 0.5;                    // Half Kelly
+  const kellyFull = edge / 100 * bankroll;
+  // Quarter-Kelly base — conservative
+  let fraction = 0.25;
+  if (edge >= 10) fraction = 0.5;
+  else if (edge >= 7) fraction = 0.4;
+  else if (edge >= 5) fraction = 0.3;
 
-  if (confidence === "low") fraction *= 0.5;
-  else if (confidence === "medium") fraction *= 0.75;
+  if (confidence === "low") fraction *= 0.4;
+  else if (confidence === "medium") fraction *= 0.7;
 
   let size = Math.round(kellyFull * fraction);
   size = Math.max(MIN_BET, size);
-  size = Math.min(bankroll * MAX_BET_PCT / 100, size);
+  size = Math.min(Math.round(bankroll * MAX_BET_PCT / 100), size);
   return size;
 }
 
@@ -380,6 +382,9 @@ export default async function handler(req, res) {
 
         if (!polyOdds) continue; // No market price = can't calculate edge
 
+        // Skip thin markets — prices unreliable without real money behind them
+        if ((polyOdds.liquidity || 0) < MIN_LIQUIDITY) continue;
+
         opportunities.push({ match: m, t1, t2, polyOdds });
       }
 
@@ -407,9 +412,9 @@ export default async function handler(req, res) {
           const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
           const edge = ourProb - marketProb;
 
-          if (ourProb < 52) continue;    // Must believe team wins convincingly
+          if (ourProb < 60) continue;    // Must believe team wins convincingly
           if (edge < MIN_EDGE) continue;  // Must have real edge vs market
-          if (pred.confidence === "low" && edge < 8) continue;
+          if (pred.confidence === "low" && ourProb < 65) continue;  // Low data needs strong conviction
 
           const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
           const betSize = calcBetSize(edge, state.bankroll, pred.confidence);
