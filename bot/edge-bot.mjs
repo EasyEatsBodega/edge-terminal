@@ -43,6 +43,16 @@ const MIN_OUR_PROB = 60;             // Keep — only bet confident picks
 const BETS_PER_RUN = 2;              // Quality over quantity — max 2 bets per run
 const PRICE_DISCOVERY_MIN = 58;      // Market must show some signal (not coin-flip territory)
 
+// ─── Market Confirmation Mode ──────────────────────────────────────────────
+// When model AND market agree on a heavy favorite, take a small position.
+// Esports markets tend to underprice favorites (degen bettors love underdogs).
+const CONFIRM_ENABLED = true;
+const CONFIRM_MIN_MARKET_PROB = 72;  // Market must see team as 72%+ favorite
+const CONFIRM_MIN_OUR_PROB = 70;     // Our model must also agree (70%+)
+const CONFIRM_MAX_BET_PCT = 2;       // Tiny bets — grinding small wins, not swinging
+const CONFIRM_MIN_LIQUIDITY = 3000;  // Higher liquidity required — need reliable prices
+const CONFIRM_MAX_PER_RUN = 1;       // Max 1 confirmation bet per run
+
 // ─── Drawdown Protection ───────────────────────────────────────────────────
 
 const DRAWDOWN_HALT_PCT = 50;        // Stop betting if bankroll drops below 50% of initial
@@ -154,28 +164,54 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
   return null;
 }
 
-// ─── Prediction Model (v2 — opponent strength + aggressive recency) ─────────
+// ─── Prediction Model (v3 — game scores, margins, dominance + recency) ─────
 
 function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
-  // Extract results with opponent info and match metadata
+  // Extract rich results — game scores, margins, not just W/L
   const getResults = (history, teamId) =>
-    history.map(m => ({
-      won: m.winner?.id === teamId,
-      oppId: m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent?.id,
-      oppName: m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent?.name || "?",
-      date: m.scheduled_at || m.begin_at,
-      bo: m.number_of_games || 1,
-      league: m.league?.name || "",
-      tournamentTier: m.tournament?.tier || "unranked",
-    })).filter(r => r.oppId !== undefined);
+    history.map(m => {
+      const teamResult = m.results?.find(r => r.team_id === teamId);
+      const oppResult = m.results?.find(r => r.team_id !== teamId);
+      const opp = m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent;
 
-  // Aggressive recency — last 5 matches weighted MUCH heavier than 6-10
+      // Game-level scores (e.g., 2-1 in BO3, 16-12 in CS2 maps)
+      const gamesWon = teamResult?.score || 0;
+      const gamesLost = oppResult?.score || 0;
+      const totalGames = gamesWon + gamesLost;
+
+      // Dominance: how convincingly did they win/lose?
+      // 2-0 win = dominance 1.0, 2-1 win = 0.5, 0-2 loss = -1.0, 1-2 loss = -0.5
+      let dominance = 0;
+      if (totalGames > 0) {
+        dominance = (gamesWon - gamesLost) / Math.max(totalGames, 1);
+      }
+
+      // Match recency in days (for time-decay)
+      const matchDate = new Date(m.scheduled_at || m.begin_at);
+      const daysAgo = (Date.now() - matchDate.getTime()) / 86400000;
+
+      return {
+        won: m.winner?.id === teamId,
+        oppId: opp?.id,
+        oppName: opp?.name || "?",
+        date: m.scheduled_at || m.begin_at,
+        daysAgo,
+        bo: m.number_of_games || 1,
+        gamesWon,
+        gamesLost,
+        dominance,        // -1 to +1: how convincing the result was
+        league: m.league?.name || "",
+        tournamentTier: m.tournament?.tier || "unranked",
+      };
+    }).filter(r => r.oppId !== undefined);
+
+  // Recent form — exponential decay + dominance weighting
+  // A 2-0 stomp counts more than a 2-1 scrape
   const recentFormWR = (results, n = 10) => {
     const recent = results.slice(0, n);
     if (!recent.length) return 50;
     let tw = 0, ww = 0;
     recent.forEach((r, i) => {
-      // Exponential decay — match 0 has weight 1.0, match 9 has weight ~0.13
       const w = Math.pow(0.8, i);
       tw += w;
       if (r.won) ww += w;
@@ -183,13 +219,36 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
     return tw > 0 ? (ww / tw) * 100 : 50;
   };
 
+  // Dominance score — average dominance across recent matches
+  // Positive = winning convincingly, negative = losing badly or barely winning
+  const dominanceScore = (results, n = 10) => {
+    const recent = results.slice(0, n);
+    if (!recent.length) return 0;
+    let tw = 0, dw = 0;
+    recent.forEach((r, i) => {
+      const w = Math.pow(0.85, i);
+      tw += w;
+      dw += r.dominance * w;
+    });
+    return tw > 0 ? dw / tw : 0;
+  };
+
+  // Close-match performance — how do they perform in tight games?
+  // Teams that win close matches (2-1, 13-16) are more clutch
+  const clutchFactor = (results) => {
+    const recent = results.slice(0, 15);
+    const closeMatches = recent.filter(r => Math.abs(r.dominance) <= 0.4 && r.bo >= 3);
+    if (closeMatches.length < 2) return 0;
+    const closeWins = closeMatches.filter(r => r.won).length;
+    // Return -5 to +5 range
+    return ((closeWins / closeMatches.length) - 0.5) * 10;
+  };
+
   // Opponent-strength-adjusted win rate — wins vs tough opponents count more
   const strengthAdjustedWR = (results) => {
     if (!results.length) return 50;
-    // Count how many of each opponent's other results were wins (proxy for strength)
     let tw = 0, ww = 0;
     results.forEach(r => {
-      // Tier-based strength multiplier
       const tierMult = r.tournamentTier === "s" ? 1.5 : r.tournamentTier === "a" ? 1.3 : r.tournamentTier === "b" ? 1.1 : 1.0;
       tw += tierMult;
       if (r.won) ww += tierMult;
@@ -208,14 +267,24 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
     return { wr: (meetings.filter(r => r.won).length / meetings.length) * 100, n: meetings.length };
   };
 
-  // Hot/cold streak detection — last 3 matches
+  // Hot/cold streak with momentum direction
   const streakFactor = (results) => {
     const last3 = results.slice(0, 3);
     if (last3.length < 3) return 0;
     const wins = last3.filter(r => r.won).length;
-    if (wins === 3) return 4;   // Hot streak bonus
-    if (wins === 0) return -4;  // Cold streak penalty
+    if (wins === 3) return 4;
+    if (wins === 0) return -4;
     return 0;
+  };
+
+  // Form trajectory — is the team improving or declining?
+  // Compare last 5 matches to matches 6-10
+  const formTrajectory = (results) => {
+    if (results.length < 8) return 0;
+    const recent5WR = results.slice(0, 5).filter(r => r.won).length / 5;
+    const prev5WR = results.slice(5, 10).filter(r => r.won).length / Math.min(5, results.slice(5, 10).length);
+    // Positive = improving, negative = declining, range roughly -3 to +3
+    return (recent5WR - prev5WR) * 6;
   };
 
   const rA = getResults(histA, teamAId);
@@ -230,9 +299,16 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
   const h2h = h2hWR(rA, teamBId);
   const streakA = streakFactor(rA);
   const streakB = streakFactor(rB);
+  const domA = dominanceScore(rA, 10);
+  const domB = dominanceScore(rB, 10);
+  const clutchA = clutchFactor(rA);
+  const clutchB = clutchFactor(rB);
+  const trajA = formTrajectory(rA);
+  const trajB = formTrajectory(rB);
 
+  // ─── Composite score ─────────────────────────────────────────────────
   const fw = weights.form || 0.40;
-  const sw = 0.20; // opponent strength weight
+  const sw = 0.20;
   const ow = weights.overall || 0.25;
   const hw = h2h.n >= 3 ? (weights.h2h || 0.15) : 0.05;
   const owAdj = ow + ((weights.h2h || 0.15) - hw);
@@ -242,22 +318,24 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 
   let prob = (sA + sB) > 0 ? (sA / (sA + sB)) * 100 : 50;
 
-  // Apply streak adjustment
-  prob += (streakA - streakB) * 0.5;
+  // Apply adjustments from richer data
+  prob += (streakA - streakB) * 0.5;            // Streak momentum
+  prob += (domA - domB) * 3;                     // Dominance: winning 2-0 vs 2-1 matters
+  prob += (clutchA - clutchB) * 0.3;            // Clutch performance in close matches
+  prob += (trajA - trajB) * 0.4;                // Form trajectory (improving vs declining)
 
   // BO format adjustment — BO1 is volatile, BO3+ rewards better team
   const bo = format || 1;
-  if (bo === 1) prob = prob * 0.75 + 50 * 0.25;  // Strong pull to 50% for BO1 — upsets are real
-  else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;  // Slight amplification for long series
+  if (bo === 1) prob = prob * 0.75 + 50 * 0.25;
+  else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;
 
   prob = Math.max(5, Math.min(95, prob));
   const confidence = Math.min(rA.length, rB.length) >= 8 ? "high" : Math.min(rA.length, rB.length) >= 4 ? "medium" : "low";
 
-  // Build thesis (plain English reasoning)
   const thesis = buildThesis(
     rA, rB, formA, formB, strengthA, strengthB, allA, allB,
     h2h, streakA, streakB, bo, prob,
-    teamAId, teamBId
+    teamAId, teamBId, domA, domB, clutchA, clutchB, trajA, trajB
   );
 
   return {
@@ -267,6 +345,9 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
     overallA: allA, overallB: allB,
     h2hWR: h2h.wr, h2hN: h2h.n,
     streakA, streakB,
+    dominanceA: domA, dominanceB: domB,
+    clutchA, clutchB,
+    trajectoryA: trajA, trajectoryB: trajB,
     recordA: `${rA.filter(r => r.won).length}-${rA.filter(r => !r.won).length}`,
     recordB: `${rB.filter(r => r.won).length}-${rB.filter(r => !r.won).length}`,
     dataPointsA: rA.length, dataPointsB: rB.length,
@@ -275,12 +356,11 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 
 // ─── Thesis Generator — plain English reasoning for each bet ────────────────
 
-function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA, streakB, bo, prob, teamAId, teamBId) {
+function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA, streakB, bo, prob, teamAId, teamBId, domA = 0, domB = 0, clutchA = 0, clutchB = 0, trajA = 0, trajB = 0) {
   const parts = [];
   const fav = prob > 50 ? "A" : "B";
   const favForm = fav === "A" ? formA : formB;
   const dogForm = fav === "A" ? formB : formA;
-  const favStr = fav === "A" ? strA : strB;
 
   // Form analysis
   const formDiff = Math.abs(formA - formB);
@@ -292,10 +372,31 @@ function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA,
     parts.push(`Similar form (${formA.toFixed(0)}% vs ${formB.toFixed(0)}%)`);
   }
 
+  // Dominance — are they winning convincingly?
+  const domDiff = domA - domB;
+  if (Math.abs(domDiff) > 0.3) {
+    const dominant = domDiff > 0 ? "A" : "B";
+    parts.push(`Team ${dominant} winning more convincingly (dominant in game scores)`);
+  }
+
+  // Trajectory — improving or declining?
+  if (Math.abs(trajA) > 1.5 || Math.abs(trajB) > 1.5) {
+    if (trajA > 1.5) parts.push("Team A trending up (recent form improving)");
+    if (trajA < -1.5) parts.push("Team A trending down (form declining)");
+    if (trajB > 1.5) parts.push("Team B trending up (recent form improving)");
+    if (trajB < -1.5) parts.push("Team B trending down (form declining)");
+  }
+
   // Strength-adjusted
   if (Math.abs(strA - strB) > 10) {
     const betterStr = strA > strB ? "A" : "B";
-    parts.push(`${betterStr === "A" ? "Team A" : "Team B"} wins against tougher opponents`);
+    parts.push(`Team ${betterStr} wins against tougher opponents`);
+  }
+
+  // Clutch factor
+  if (Math.abs(clutchA - clutchB) > 3) {
+    const clutcher = clutchA > clutchB ? "A" : "B";
+    parts.push(`Team ${clutcher} better in close matches`);
   }
 
   // H2H
@@ -747,6 +848,107 @@ async function runBot() {
           `⏰ Match: ${new Date(position.matchTime).toLocaleString()}` +
           polyLink
         );
+      }
+
+      // ─── Market Confirmation Bets ───────────────────────────────────────
+      // When model AND market both agree on a heavy favorite, take a small position.
+      // Thesis: esports markets slightly underprice favorites because degen bettors
+      // love underdogs. If our model confirms the market's heavy favorite, the true
+      // probability is likely even higher than quoted.
+      if (CONFIRM_ENABLED && state.openPositions.length < MAX_POSITIONS) {
+        let confirmBets = 0;
+
+        for (const opp of opportunities) {
+          if (confirmBets >= CONFIRM_MAX_PER_RUN) break;
+          if (state.openPositions.length >= MAX_POSITIONS) break;
+          if (state.openPositions.some(p => p.matchId === opp.match.id)) continue;
+          if ((opp.polyOdds.liquidity || 0) < CONFIRM_MIN_LIQUIDITY) continue;
+
+          // Already placed an edge bet on this match?
+          if (betsPlaced.some(b => b.matchId === opp.match.id)) continue;
+
+          // Need to fetch prediction if not already analyzed
+          let pred;
+          const alreadyAnalyzed = analyzed.find(a => a.opp.match.id === opp.match.id);
+          if (alreadyAnalyzed) {
+            pred = alreadyAnalyzed.pred;
+          } else {
+            try {
+              const [histA, histB] = await Promise.all([
+                pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t1.id}&per_page=25&sort=-scheduled_at`),
+                pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t2.id}&per_page=25&sort=-scheduled_at`),
+              ]);
+              pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights);
+            } catch { continue; }
+          }
+
+          const pickSide = pred.probA >= pred.probB ? "A" : "B";
+          const ourProb = pickSide === "A" ? pred.probA : pred.probB;
+          const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
+
+          // Both model and market must agree this is a heavy favorite
+          if (marketProb < CONFIRM_MIN_MARKET_PROB) continue;
+          if (ourProb < CONFIRM_MIN_OUR_PROB) continue;
+          if (pred.confidence === "low") continue;  // Need decent data
+
+          // Tiny bet — grinding, not swinging
+          const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * CONFIRM_MAX_BET_PCT / 100));
+          const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
+          if (confirmSize > state.bankroll - currentDeployed) continue;
+
+          const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
+          const edge = ourProb - marketProb;
+
+          const position = {
+            id: `confirm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            matchId: opp.match.id,
+            game: opp.match._game,
+            teamA: opp.t1.acronym || opp.t1.name,
+            teamB: opp.t2.acronym || opp.t2.name,
+            teamAId: opp.t1.id,
+            teamBId: opp.t2.id,
+            pick, pickSide,
+            ourProb: +ourProb.toFixed(1),
+            marketProb: +marketProb.toFixed(1),
+            edge: +edge.toFixed(1),
+            betSize: confirmSize,
+            betPercent: +(confirmSize / state.bankroll * 100).toFixed(1),
+            confidence: pred.confidence,
+            betType: "confirmation",  // Tag it so we can track performance separately
+            event: `${opp.t1.acronym || opp.t1.name} vs ${opp.t2.acronym || opp.t2.name}`,
+            league: opp.match.league?.name || "",
+            format: opp.match.number_of_games || 1,
+            placedAt: now.toISOString(),
+            matchTime: opp.match.scheduled_at,
+            formA: pred.recordA,
+            formB: pred.recordB,
+            thesis: `CONFIRMATION BET: Model (${ourProb.toFixed(0)}%) and market (${marketProb.toFixed(0)}%) both agree — heavy favorite. ${pred.thesis || ""}`,
+            polyUrl: opp.polyOdds.polyUrl || null,
+            polyLiquidity: opp.polyOdds.liquidity,
+            matchStatus: "upcoming",
+          };
+
+          state.openPositions.push(position);
+          state.bankroll -= confirmSize;
+          confirmBets++;
+
+          push(`🎯 CONFIRM BET: ${pick} in ${position.event} | Model: ${ourProb.toFixed(1)}% | Market: ${marketProb.toFixed(1)}% | Size: $${confirmSize} (small grind)`);
+
+          const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
+          await sendTG(
+            `🎯 <b>CONFIRMATION BET</b>\n\n` +
+            `🎮 ${opp.match._game.toUpperCase()}\n` +
+            `📋 ${position.event}\n` +
+            `🏆 ${position.league} · BO${position.format}\n\n` +
+            `<b>Pick: ${pick} (heavy favorite)</b>\n` +
+            `Our model: <b>${ourProb.toFixed(1)}%</b>\n` +
+            `Market: <b>${marketProb.toFixed(1)}%</b>\n` +
+            `Both agree — taking the chalk.\n\n` +
+            `💵 Bet: <b>$${confirmSize}</b> (${position.betPercent}% — small grind)\n` +
+            `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>` +
+            polyLink
+          );
+        }
       }
     } else {
       if (state.openPositions.length >= MAX_POSITIONS) push("⏸️ Max positions reached");

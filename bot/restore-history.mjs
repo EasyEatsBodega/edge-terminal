@@ -1,22 +1,35 @@
 #!/usr/bin/env node
 // One-time script — sets EXACT state. No merging, no reading old state.
-import { writeFileSync } from "node:fs";
+// Last synced from live bot: Apr 8, 2026 (run #247)
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = join(__dirname, "state.json");
 
-// The 3 original losses from the broken edge logic (v1 bot, wrong-side picks)
-// Plus the PNG.A loss from today (new filters, legit loss)
-// Total closed P&L: -57.72 - 51.44 - 47.00 - 80.00 = -$236.16
-// Bankroll: $1000 - $236.16 = $763.84
+// If state.json already exists on the VPS, don't overwrite — the bot's state is the source of truth.
+// Only run this script if state.json is missing (fresh deploy) or you explicitly want to reset.
+if (existsSync(STATE_PATH)) {
+  const existing = JSON.parse(readFileSync(STATE_PATH, "utf-8"));
+  console.log(`⚠️  state.json already exists. Bankroll: $${existing.bankroll?.toFixed(2)}`);
+  console.log("   The bot's live state is the source of truth.");
+  console.log("   To force overwrite, delete state.json first then re-run.");
+  process.exit(0);
+}
+
+// Actual state as of Apr 8 2026, 5:20 PM UTC (from bot /status)
+// Record: 1W - 5L (16.7% hit rate) | Closed P&L: -$260.16
+// Bankroll: $543.84 (includes $196 deployed in 3 open positions that have since resolved)
+// NOTE: If open positions resolved, the bot already tracked them.
+//       This restore is a fallback for fresh deploys only.
 
 const state = {
-  bankroll: 763.84,
+  bankroll: 543.84,
   initialBankroll: 1000,
   openPositions: [],
   closedPositions: [
+    // Most recent first
     {
       id: "bet_v2_png", matchId: 0, game: "csgo",
       teamA: "EST", teamB: "PNG.A",
@@ -59,10 +72,10 @@ const state = {
     },
   ],
   modelWeights: { form: 0.45, overall: 0.35, h2h: 0.15, formN: 10 },
-  calibration: { totalPredictions: 4, correctPredictions: 0, bins: {} },
+  calibration: { totalPredictions: 6, correctPredictions: 1, bins: {} },
   lastRunAt: new Date().toISOString(),
-  totalRuns: 67,
+  totalRuns: 247,
 };
 
 writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-console.log("✅ State set. 0W-4L record. Bankroll: $763.84. P&L: -$236.16");
+console.log("✅ State set. 1W-5L record. Bankroll: $543.84. P&L: -$456.16");
