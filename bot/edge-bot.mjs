@@ -47,12 +47,39 @@ const PRICE_DISCOVERY_MIN = 58;      // Market must show some signal (not coin-f
 // When model AND market agree on a heavy favorite, take a bigger position.
 // Esports markets tend to underprice favorites (degen bettors love underdogs).
 // These are our "safe" plays — both signals agree, so size up.
+// TIERED: 85%+ lock = bigger bet, 72-84% = standard bet.
 const CONFIRM_ENABLED = true;
 const CONFIRM_MIN_MARKET_PROB = 72;  // Market must see team as 72%+ favorite
 const CONFIRM_MIN_OUR_PROB = 70;     // Our model must also agree (70%+)
-const CONFIRM_MAX_BET_PCT = 5;       // 5% of bankroll — confident plays deserve real sizing
 const CONFIRM_MIN_LIQUIDITY = 3000;  // Higher liquidity required — need reliable prices
 const CONFIRM_MAX_PER_RUN = 2;       // Up to 2 confirmation bets per run
+
+// Tiered sizing — stronger consensus = bigger position
+const CONFIRM_TIERS = [
+  { minMarket: 85, minModel: 82, pct: 8, label: "LOCK" },     // 85%+ market + 82%+ model = 8% bankroll
+  { minMarket: 78, minModel: 76, pct: 6, label: "STRONG" },   // 78%+ = 6%
+  { minMarket: 72, minModel: 70, pct: 4, label: "LEAN" },     // 72%+ = 4% (base tier)
+];
+
+// ─── Game-Specific Adjustments ─────────────────────────────────────────────
+// CS2, Dota 2, and LoL play very differently. One model doesn't fit all.
+const GAME_TUNING = {
+  csgo: {
+    bo1Penalty: 0.30,    // CS2 BO1 is extremely volatile (pistol rounds, eco stacks)
+    formWeight: 1.1,     // Recent form matters more in CS2 (map pool meta shifts)
+    minEdge: 6,          // Need bigger edge — CS2 markets are sharper
+  },
+  dota2: {
+    bo1Penalty: 0.20,    // Dota BO1 less volatile than CS2 (draft matters more)
+    formWeight: 0.9,     // Patches shake up Dota form — overall matters more
+    minEdge: 5,          // Standard edge threshold
+  },
+  lol: {
+    bo1Penalty: 0.22,    // LoL BO1 moderate volatility
+    formWeight: 1.0,     // Standard form weight
+    minEdge: 5,          // Standard edge threshold
+  },
+};
 
 // ─── Drawdown Protection ───────────────────────────────────────────────────
 
@@ -181,7 +208,7 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
 
 // ─── Prediction Model (v3 — game scores, margins, dominance + recency) ─────
 
-function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
+function computePrediction(teamAId, teamBId, histA, histB, format, weights, game = null) {
   // Extract rich results — game scores, margins, not just W/L
   const getResults = (history, teamId) =>
     history.map(m => {
@@ -349,9 +376,11 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
   if (rustA > 0) prob = prob * (1 - rustA) + 50 * rustA;
   if (rustB > 0) prob = prob * (1 - rustB) + 50 * rustB;  // Rusty opponent = pull our edge back
 
-  // BO format adjustment — BO1 is volatile, BO3+ rewards better team
+  // BO format adjustment — game-specific volatility
   const bo = format || 1;
-  if (bo === 1) prob = prob * 0.75 + 50 * 0.25;
+  const gt = game ? GAME_TUNING[game] : null;
+  const bo1Pull = gt ? gt.bo1Penalty : 0.25;  // How much to pull BO1 toward 50%
+  if (bo === 1) prob = prob * (1 - bo1Pull) + 50 * bo1Pull;
   else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;
 
   prob = Math.max(5, Math.min(95, prob));
@@ -807,7 +836,7 @@ async function runBot() {
             pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t2.id}&per_page=25&sort=-scheduled_at`),
           ]);
 
-          const pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights);
+          const pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights, opp.match._game);
 
           const pickSide = pred.probA >= pred.probB ? "A" : "B";
           const ourProb = pickSide === "A" ? pred.probA : pred.probB;
@@ -819,7 +848,9 @@ async function runBot() {
           // Edge bet filters — only if circuit breaker is NOT active
           if (circuitBroken) continue;
           if (ourProb < MIN_OUR_PROB) continue;
-          if (edge < MIN_EDGE) continue;
+          // Game-specific minimum edge (CS2 markets are sharper, need bigger edge)
+          const gameMinEdge = GAME_TUNING[opp.match._game]?.minEdge || MIN_EDGE;
+          if (edge < gameMinEdge) continue;
           if (pred.confidence === "low" && ourProb < 65) continue;
 
           analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
@@ -935,7 +966,9 @@ async function runBot() {
           if (ourProb < CONFIRM_MIN_OUR_PROB) continue;
           if (pred.confidence === "low") continue;  // Need decent data
 
-          const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * CONFIRM_MAX_BET_PCT / 100));
+          // Tiered sizing — stronger consensus = bigger position
+          const tier = CONFIRM_TIERS.find(t => marketProb >= t.minMarket && ourProb >= t.minModel) || CONFIRM_TIERS[CONFIRM_TIERS.length - 1];
+          const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * tier.pct / 100));
           const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
           if (confirmSize > state.bankroll - currentDeployed) continue;
 
@@ -959,6 +992,7 @@ async function runBot() {
             betPercent: +(confirmSize / state.bankroll * 100).toFixed(1),
             confidence: pred.confidence,
             betType: "confirmation",  // Tag it so we can track performance separately
+            confirmTier: tier.label,
             event: `${opp.t1.acronym || opp.t1.name} vs ${opp.t2.acronym || opp.t2.name}`,
             league: opp.match.league?.name || "",
             format: opp.match.number_of_games || 1,
@@ -976,11 +1010,11 @@ async function runBot() {
           state.bankroll -= confirmSize;
           confirmBets++;
 
-          push(`🎯 CONFIRM BET: ${pick} in ${position.event} | Model: ${ourProb.toFixed(1)}% | Market: ${marketProb.toFixed(1)}% | Size: $${confirmSize} (small grind)`);
+          push(`🎯 CONFIRM [${tier.label}]: ${pick} in ${position.event} | Model: ${ourProb.toFixed(1)}% | Market: ${marketProb.toFixed(1)}% | Size: $${confirmSize} (${tier.pct}%)`);
 
           const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
           await sendTG(
-            `🎯 <b>CONFIRMATION BET</b>\n\n` +
+            `🎯 <b>CONFIRMATION BET [${tier.label}]</b>\n\n` +
             `🎮 ${opp.match._game.toUpperCase()}\n` +
             `📋 ${position.event}\n` +
             `🏆 ${position.league} · BO${position.format}\n\n` +
@@ -988,7 +1022,7 @@ async function runBot() {
             `Our model: <b>${ourProb.toFixed(1)}%</b>\n` +
             `Market: <b>${marketProb.toFixed(1)}%</b>\n` +
             `Both agree — taking the chalk.\n\n` +
-            `💵 Bet: <b>$${confirmSize}</b> (${position.betPercent}% — small grind)\n` +
+            `💵 Bet: <b>$${confirmSize}</b> (${tier.pct}% bankroll — ${tier.label})\n` +
             `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>` +
             polyLink
           );
@@ -1293,6 +1327,26 @@ async function handleTelegramCommand(text) {
     const allWins = closed.filter(p => p.result === "win").length;
     const allLosses = closed.filter(p => p.result === "loss").length;
 
+    // Split by bet type
+    const edgeBets = closed.filter(p => p.betType !== "confirmation");
+    const confirmBets = closed.filter(p => p.betType === "confirmation");
+    const edgeWins = edgeBets.filter(p => p.result === "win").length;
+    const edgeLosses = edgeBets.filter(p => p.result === "loss").length;
+    const edgePnl = edgeBets.reduce((s, p) => s + (p.pnl || 0), 0);
+    const confirmWins = confirmBets.filter(p => p.result === "win").length;
+    const confirmLosses = confirmBets.filter(p => p.result === "loss").length;
+    const confirmPnl = confirmBets.reduce((s, p) => s + (p.pnl || 0), 0);
+
+    // By game
+    const games = {};
+    closed.forEach(p => {
+      const g = p.game || "unknown";
+      if (!games[g]) games[g] = { wins: 0, losses: 0, pnl: 0 };
+      if (p.result === "win") games[g].wins++;
+      else games[g].losses++;
+      games[g].pnl += p.pnl || 0;
+    });
+
     // Bot vs Market accuracy
     let botRight = 0, mktRight = 0;
     closed.forEach(p => {
@@ -1314,6 +1368,28 @@ async function handleTelegramCommand(text) {
     msg += `💰 P&L: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b> (${(totalPnl / (state.initialBankroll || 1000) * 100).toFixed(1)}% ROI)\n`;
     msg += `🎯 Record: <b>${allWins}W - ${allLosses}L</b> (${allWins + allLosses > 0 ? (allWins / (allWins + allLosses) * 100).toFixed(0) : 0}%)\n\n`;
 
+    // Strategy breakdown
+    msg += `📈 <b>BY STRATEGY</b>\n`;
+    if (edgeBets.length > 0) {
+      msg += `   Edge: ${edgeWins}W-${edgeLosses}L (${edgeWins + edgeLosses > 0 ? (edgeWins / (edgeWins + edgeLosses) * 100).toFixed(0) : 0}%) | ${edgePnl >= 0 ? "+" : ""}$${edgePnl.toFixed(2)}\n`;
+    }
+    if (confirmBets.length > 0) {
+      msg += `   Confirm: ${confirmWins}W-${confirmLosses}L (${confirmWins + confirmLosses > 0 ? (confirmWins / (confirmWins + confirmLosses) * 100).toFixed(0) : 0}%) | ${confirmPnl >= 0 ? "+" : ""}$${confirmPnl.toFixed(2)}\n`;
+    }
+    msg += "\n";
+
+    // By game
+    if (Object.keys(games).length > 0) {
+      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+      msg += `🎮 <b>BY GAME</b>\n`;
+      Object.entries(games).forEach(([g, d]) => {
+        const label = GLABEL[g] || g;
+        const total = d.wins + d.losses;
+        msg += `   ${label}: ${d.wins}W-${d.losses}L (${total > 0 ? (d.wins / total * 100).toFixed(0) : 0}%) | ${d.pnl >= 0 ? "+" : ""}$${d.pnl.toFixed(2)}\n`;
+      });
+      msg += "\n";
+    }
+
     if (closed.length > 0) {
       msg += `🤖 <b>BOT vs MARKET</b>\n`;
       msg += `   Bot correct: ${botRight}/${closed.length} (${(botRight / closed.length * 100).toFixed(0)}%)\n`;
@@ -1334,7 +1410,8 @@ async function handleTelegramCommand(text) {
       msg += `📋 <b>LAST 5 TRADES</b>\n`;
       recent5.forEach(p => {
         const emoji = p.result === "win" ? "✅" : "❌";
-        msg += `   ${emoji} ${p.pick} (${p.event}) ${p.pnl >= 0 ? "+" : ""}$${p.pnl.toFixed(2)}\n`;
+        const typeTag = p.betType === "confirmation" ? " [C]" : " [E]";
+        msg += `   ${emoji}${typeTag} ${p.pick} (${p.event}) ${p.pnl >= 0 ? "+" : ""}$${p.pnl.toFixed(2)}\n`;
       });
     }
 
