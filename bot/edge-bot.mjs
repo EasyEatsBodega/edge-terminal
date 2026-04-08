@@ -31,16 +31,17 @@ const CFG = loadConfig();
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INITIAL_BANKROLL = 1000;
-const MAX_DEPLOYED_PCT = 25;
-const MAX_POSITIONS = 8;
-const MIN_EDGE = 4;
-const MAX_BET_PCT = 8;
+const MAX_DEPLOYED_PCT = 40;         // Deploy more capital — we're taking high-prob picks
+const MAX_POSITIONS = 10;
+const MIN_EDGE = 3;                  // Lower edge threshold — if we're 65%+ confident, 3% edge is fine
+const MAX_BET_PCT = 10;              // Bigger bets on high-confidence plays
 const MIN_BET = 10;
 const BET_WINDOW_MIN_H = 0.25;
-const BET_WINDOW_MAX_H = 8;          // Only bet matches starting within 8 hours
-const MIN_LIQUIDITY = 1000;       // Skip markets with < $1k liquidity (no real price discovery)
-const MIN_OUR_PROB = 55;          // Only bet teams we give 55%+ to win
-const BETS_PER_RUN = 3;           // Take up to 3 best bets per run
+const BET_WINDOW_MAX_H = 12;         // Wider window — more games to pick from
+const MIN_LIQUIDITY = 500;           // Lower liq floor — more markets available
+const MIN_OUR_PROB = 60;             // Only bet when model says 60%+ to WIN — high likelihood plays
+const BETS_PER_RUN = 5;              // Take up to 5 plays per run — more action
+const HIGH_CONF_PROB = 70;           // 70%+ model probability = size up aggressively
 
 // ─── File-Based State ───────────────────────────────────────────────────────
 
@@ -311,7 +312,7 @@ function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA,
 
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
 
-function calcBetSize(edge, bankroll, confidence, format = 3) {
+function calcBetSize(edge, bankroll, confidence, format = 3, ourProb = 50) {
   const kellyFull = edge / 100 * bankroll;
   let fraction;
   if (edge >= 8) fraction = 1.0;
@@ -321,8 +322,12 @@ function calcBetSize(edge, bankroll, confidence, format = 3) {
   if (confidence === "low") fraction *= 0.5;
   else if (confidence === "medium") fraction *= 0.75;
 
-  // BO1 penalty — half the bet size due to high variance
-  if (format === 1) fraction *= 0.5;
+  // HIGH PROBABILITY BOOST — if model is 70%+ confident, size up
+  if (ourProb >= HIGH_CONF_PROB) fraction *= 1.5;
+  else if (ourProb >= 65) fraction *= 1.2;
+
+  // BO1 penalty — reduce bet size due to high variance
+  if (format === 1) fraction *= 0.6;  // Less harsh than before (was 0.5)
 
   let size = Math.round(kellyFull * fraction);
   size = Math.max(MIN_BET, size);
@@ -527,9 +532,9 @@ async function runBot() {
           continue;
         }
 
-        // FILTER: Skip markets where both sides are 40-60% — no real price discovery
+        // FILTER: Skip markets where both sides are dead even (45-55%) — need SOME signal
         const maxProb = Math.max(polyOdds.probA, polyOdds.probB);
-        if (maxProb < 60) {
+        if (maxProb < 53) {
           skippedLowLiq++;
           continue;
         }
@@ -556,9 +561,9 @@ async function runBot() {
           const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
           const edge = ourProb - marketProb;
 
-          if (ourProb < MIN_OUR_PROB) continue;   // Must strongly believe team wins
-          if (edge < MIN_EDGE) continue;           // Must have real edge vs market
-          if (pred.confidence === "low" && edge < 10) continue;  // Low confidence needs BIG edge
+          if (ourProb < MIN_OUR_PROB) continue;   // Must believe team wins (60%+)
+          if (edge < MIN_EDGE) continue;           // Must have edge vs market (3%+)
+          if (pred.confidence === "low" && ourProb < 65) continue;  // Low data? Need strong conviction
 
           analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
         } catch (e) {
@@ -589,7 +594,7 @@ async function runBot() {
         if (currentDeployed / state.bankroll * 100 >= MAX_DEPLOYED_PCT) break;
 
         const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1);
+        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1, a.ourProb);
 
         if (betSize > state.bankroll - currentDeployed) continue;
 
