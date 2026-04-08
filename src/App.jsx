@@ -933,6 +933,22 @@ export default function App() {
                 gameStats[g].pnl += (p.pnl || 0);
               });
 
+              // Bot vs Market accuracy
+              let botRight = 0, mktRight = 0;
+              closed.forEach(p => {
+                const botSaysWin = p.ourProb > 50;
+                const mktSaysWin = p.marketProb > 50;
+                const actualWin = p.result === "win";
+                if (botSaysWin === actualWin) botRight++;
+                if (mktSaysWin === actualWin) mktRight++;
+              });
+
+              // Loss reasons
+              const lossReasons = {};
+              closed.filter(p => p.lossReason).forEach(p => {
+                lossReasons[p.lossReason] = (lossReasons[p.lossReason] || 0) + 1;
+              });
+
               return (<>
               {/* Hero Stats */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
@@ -1001,6 +1017,47 @@ export default function App() {
                 </div>
               )}
 
+              {/* Bot vs Market + Loss Analysis */}
+              {totalResolved > 0 && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+                  <div style={{ background: PAL.panel, borderRadius: 10, padding: "14px 18px", border: `1px solid ${PAL.border}` }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12, color: PAL.sub }}>Bot vs Market Accuracy</div>
+                    <div style={{ display: "flex", gap: 20 }}>
+                      <div>
+                        <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 2 }}>Bot</div>
+                        <div style={{ fontSize: 24, fontWeight: 800, color: botRight > mktRight ? PAL.green : PAL.sub }}>
+                          {(botRight / totalResolved * 100).toFixed(0)}%
+                        </div>
+                        <div style={{ fontSize: 11, color: PAL.dim }}>{botRight}/{totalResolved} correct</div>
+                      </div>
+                      <div style={{ width: 1, background: PAL.border }} />
+                      <div>
+                        <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 2 }}>Market</div>
+                        <div style={{ fontSize: 24, fontWeight: 800, color: mktRight > botRight ? PAL.green : PAL.sub }}>
+                          {(mktRight / totalResolved * 100).toFixed(0)}%
+                        </div>
+                        <div style={{ fontSize: 11, color: PAL.dim }}>{mktRight}/{totalResolved} correct</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ background: PAL.panel, borderRadius: 10, padding: "14px 18px", border: `1px solid ${PAL.border}` }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12, color: PAL.sub }}>Loss Analysis</div>
+                    {Object.keys(lossReasons).length > 0 ? (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {Object.entries(lossReasons).sort((a, b) => b[1] - a[1]).map(([reason, count]) => (
+                          <div key={reason} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <span style={{ fontSize: 12, color: PAL.sub }}>{reason}</span>
+                            <span style={{ fontSize: 12, fontWeight: 700, color: PAL.red }}>{count}x</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 12, color: PAL.dim }}>Loss reasons tracked on new bets</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Model Weights + Calibration Row */}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
                 <div style={{ background: PAL.panel, borderRadius: 10, padding: 14, border: `1px solid ${PAL.border}` }}>
@@ -1064,8 +1121,12 @@ export default function App() {
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                     {open.map(p => (
-                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 60px 80px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${PAL.yellow}`, alignItems: "center", gap: 8, fontSize: 13 }}>
-                        <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
+                      <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 60px 80px 32px", padding: "10px 14px", borderRadius: p.thesis ? "8px 8px 0 0" : 8, background: PAL.panel, borderLeft: `3px solid ${p.matchStatus === "live" ? PAL.red : PAL.yellow}`, alignItems: "center", gap: 8, fontSize: 13 }}>
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
+                          {p.matchStatus === "live" && <span style={{ fontSize: 8, fontWeight: 700, color: PAL.red, background: `${PAL.red}20`, padding: "1px 4px", borderRadius: 3 }}>LIVE</span>}
+                        </div>
                         <div>
                           <div style={{ fontWeight: 600 }}>{p.pick}</div>
                           <div style={{ fontSize: 11, color: PAL.dim }}>{p.event} · {p.league}{p.format > 1 ? ` · BO${p.format}` : ""}</div>
@@ -1087,6 +1148,12 @@ export default function App() {
                         <div style={{ textAlign: "center" }}>
                           {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
                         </div>
+                      </div>
+                      {p.thesis && (
+                        <div style={{ padding: "6px 14px 8px", background: PAL.card, borderLeft: `3px solid ${p.matchStatus === "live" ? PAL.red : PAL.yellow}`, borderRadius: "0 0 8px 8px", fontSize: 11, color: PAL.dim, fontStyle: "italic" }}>
+                          {p.thesis}
+                        </div>
+                      )}
                       </div>
                     ))}
                   </div>
@@ -1140,6 +1207,12 @@ export default function App() {
                           {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
                         </div>
                       </div>
+                      {p.lossReason && (
+                        <div style={{ gridColumn: "1 / -1", padding: "4px 14px 6px", fontSize: 10, color: PAL.red, fontStyle: "italic", background: `${PAL.red}05`, borderRadius: "0 0 6px 6px", marginTop: -2 }}>
+                          Loss reason: {p.lossReason}
+                        </div>
+                      )}
+                    </div>
                     ))}
                   </div>
                 )}

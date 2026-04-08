@@ -146,20 +146,46 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
   return null;
 }
 
-// ─── Prediction Model ───────────────────────────────────────────────────────
+// ─── Prediction Model (v2 — opponent strength + aggressive recency) ─────────
 
 function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
+  // Extract results with opponent info and match metadata
   const getResults = (history, teamId) =>
     history.map(m => ({
       won: m.winner?.id === teamId,
       oppId: m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent?.id,
+      oppName: m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent?.name || "?",
+      date: m.scheduled_at || m.begin_at,
+      bo: m.number_of_games || 1,
+      league: m.league?.name || "",
+      tournamentTier: m.tournament?.tier || "unranked",
     })).filter(r => r.oppId !== undefined);
 
-  const weightedWR = (results, n = 10) => {
+  // Aggressive recency — last 5 matches weighted MUCH heavier than 6-10
+  const recentFormWR = (results, n = 10) => {
     const recent = results.slice(0, n);
     if (!recent.length) return 50;
     let tw = 0, ww = 0;
-    recent.forEach((r, i) => { const w = 1 - i / (n * 1.5); tw += w; if (r.won) ww += w; });
+    recent.forEach((r, i) => {
+      // Exponential decay — match 0 has weight 1.0, match 9 has weight ~0.13
+      const w = Math.pow(0.8, i);
+      tw += w;
+      if (r.won) ww += w;
+    });
+    return tw > 0 ? (ww / tw) * 100 : 50;
+  };
+
+  // Opponent-strength-adjusted win rate — wins vs tough opponents count more
+  const strengthAdjustedWR = (results) => {
+    if (!results.length) return 50;
+    // Count how many of each opponent's other results were wins (proxy for strength)
+    let tw = 0, ww = 0;
+    results.forEach(r => {
+      // Tier-based strength multiplier
+      const tierMult = r.tournamentTier === "s" ? 1.5 : r.tournamentTier === "a" ? 1.3 : r.tournamentTier === "b" ? 1.1 : 1.0;
+      tw += tierMult;
+      if (r.won) ww += tierMult;
+    });
     return tw > 0 ? (ww / tw) * 100 : 50;
   };
 
@@ -174,44 +200,118 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
     return { wr: (meetings.filter(r => r.won).length / meetings.length) * 100, n: meetings.length };
   };
 
+  // Hot/cold streak detection — last 3 matches
+  const streakFactor = (results) => {
+    const last3 = results.slice(0, 3);
+    if (last3.length < 3) return 0;
+    const wins = last3.filter(r => r.won).length;
+    if (wins === 3) return 4;   // Hot streak bonus
+    if (wins === 0) return -4;  // Cold streak penalty
+    return 0;
+  };
+
   const rA = getResults(histA, teamAId);
   const rB = getResults(histB, teamBId);
-  const formA = weightedWR(rA, weights.formN || 10);
-  const formB = weightedWR(rB, weights.formN || 10);
+
+  const formA = recentFormWR(rA, 10);
+  const formB = recentFormWR(rB, 10);
+  const strengthA = strengthAdjustedWR(rA.slice(0, 15));
+  const strengthB = strengthAdjustedWR(rB.slice(0, 15));
   const allA = overallWR(rA);
   const allB = overallWR(rB);
   const h2h = h2hWR(rA, teamBId);
+  const streakA = streakFactor(rA);
+  const streakB = streakFactor(rB);
 
-  const fw = weights.form || 0.45;
-  const ow = weights.overall || 0.35;
+  const fw = weights.form || 0.40;
+  const sw = 0.20; // opponent strength weight
+  const ow = weights.overall || 0.25;
   const hw = h2h.n >= 3 ? (weights.h2h || 0.15) : 0.05;
   const owAdj = ow + ((weights.h2h || 0.15) - hw);
 
-  const sA = fw * formA + owAdj * allA + hw * h2h.wr;
-  const sB = fw * formB + owAdj * allB + hw * (100 - h2h.wr);
+  const sA = fw * formA + sw * strengthA + owAdj * allA + hw * h2h.wr;
+  const sB = fw * formB + sw * strengthB + owAdj * allB + hw * (100 - h2h.wr);
 
   let prob = (sA + sB) > 0 ? (sA / (sA + sB)) * 100 : 50;
 
+  // Apply streak adjustment
+  prob += (streakA - streakB) * 0.5;
+
+  // BO format adjustment — BO1 is volatile, BO3+ rewards better team
   const bo = format || 1;
-  if (bo === 1) prob = prob * 0.88 + 50 * 0.12;
-  else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;
+  if (bo === 1) prob = prob * 0.82 + 50 * 0.18;  // Stronger pull to 50% for BO1
+  else if (bo >= 5) prob = 50 + (prob - 50) * 1.12;
 
   prob = Math.max(5, Math.min(95, prob));
   const confidence = Math.min(rA.length, rB.length) >= 8 ? "high" : Math.min(rA.length, rB.length) >= 4 ? "medium" : "low";
 
+  // Build thesis (plain English reasoning)
+  const thesis = buildThesis(
+    rA, rB, formA, formB, strengthA, strengthB, allA, allB,
+    h2h, streakA, streakB, bo, prob,
+    teamAId, teamBId
+  );
+
   return {
-    probA: prob, probB: 100 - prob, confidence,
-    formA: weightedWR(rA, 10), formB: weightedWR(rB, 10),
+    probA: prob, probB: 100 - prob, confidence, thesis,
+    formA: recentFormWR(rA, 10), formB: recentFormWR(rB, 10),
+    strengthA, strengthB,
     overallA: allA, overallB: allB,
     h2hWR: h2h.wr, h2hN: h2h.n,
+    streakA, streakB,
     recordA: `${rA.filter(r => r.won).length}-${rA.filter(r => !r.won).length}`,
     recordB: `${rB.filter(r => r.won).length}-${rB.filter(r => !r.won).length}`,
+    dataPointsA: rA.length, dataPointsB: rB.length,
   };
+}
+
+// ─── Thesis Generator — plain English reasoning for each bet ────────────────
+
+function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA, streakB, bo, prob, teamAId, teamBId) {
+  const parts = [];
+  const fav = prob > 50 ? "A" : "B";
+  const favForm = fav === "A" ? formA : formB;
+  const dogForm = fav === "A" ? formB : formA;
+  const favStr = fav === "A" ? strA : strB;
+
+  // Form analysis
+  const formDiff = Math.abs(formA - formB);
+  if (formDiff > 15) {
+    parts.push(`Strong form gap — ${favForm.toFixed(0)}% vs ${dogForm.toFixed(0)}% weighted recent`);
+  } else if (formDiff > 8) {
+    parts.push(`Moderate form edge (${favForm.toFixed(0)}% vs ${dogForm.toFixed(0)}%)`);
+  } else {
+    parts.push(`Similar form (${formA.toFixed(0)}% vs ${formB.toFixed(0)}%)`);
+  }
+
+  // Strength-adjusted
+  if (Math.abs(strA - strB) > 10) {
+    const betterStr = strA > strB ? "A" : "B";
+    parts.push(`${betterStr === "A" ? "Team A" : "Team B"} wins against tougher opponents`);
+  }
+
+  // H2H
+  if (h2h.n >= 3) {
+    if (h2h.wr > 60) parts.push(`H2H favors Team A (${h2h.wr.toFixed(0)}% in ${h2h.n} meetings)`);
+    else if (h2h.wr < 40) parts.push(`H2H favors Team B (${(100 - h2h.wr).toFixed(0)}% in ${h2h.n} meetings)`);
+  }
+
+  // Streaks
+  if (streakA > 0) parts.push("Team A on 3W hot streak");
+  if (streakA < 0) parts.push("Team A on 3L cold streak");
+  if (streakB > 0) parts.push("Team B on 3W hot streak");
+  if (streakB < 0) parts.push("Team B on 3L cold streak");
+
+  // Format
+  if (bo === 1) parts.push("BO1 increases upset risk significantly");
+  else if (bo >= 3) parts.push(`BO${bo} favors the better team`);
+
+  return parts.join(". ") + ".";
 }
 
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
 
-function calcBetSize(edge, bankroll, confidence) {
+function calcBetSize(edge, bankroll, confidence, format = 3) {
   const kellyFull = edge / 100 * bankroll;
   let fraction;
   if (edge >= 8) fraction = 1.0;
@@ -220,6 +320,9 @@ function calcBetSize(edge, bankroll, confidence) {
 
   if (confidence === "low") fraction *= 0.5;
   else if (confidence === "medium") fraction *= 0.75;
+
+  // BO1 penalty — half the bet size due to high variance
+  if (format === 1) fraction *= 0.5;
 
   let size = Math.round(kellyFull * fraction);
   size = Math.max(MIN_BET, size);
@@ -338,7 +441,20 @@ async function runBot() {
 
         if (won) state.bankroll += pos.betSize + pnl;
 
-        const closed = { ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString() };
+        // Loss analysis — figure out WHY we lost
+        let lossReason = "";
+        if (!won) {
+          if (pos.confidence === "low") lossReason = "Low confidence pick — insufficient data";
+          else if (pos.format === 1) lossReason = "BO1 upset — high variance format";
+          else if (pos.ourProb < 60) lossReason = "Marginal edge — model wasn't confident enough";
+          else if (pos.edge < 5) lossReason = "Thin edge — market was close to correct";
+          else lossReason = "Model overestimated — market was right";
+        }
+
+        const closed = {
+          ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString(),
+          lossReason: won ? null : lossReason,
+        };
         state.closedPositions.unshift(closed);
         resolvedCount++;
 
@@ -350,8 +466,9 @@ async function runBot() {
         if (won) state.calibration.correctPredictions++;
 
         const emoji = won ? "✅" : "❌";
-        push(`${emoji} Resolved: ${pos.pick} (${pos.event}) → ${result} | P&L: $${pnl.toFixed(2)}`);
-        await sendTG(`${emoji} <b>BET RESOLVED</b>\n\n${pos.event}\nPick: <b>${pos.pick}</b>\nResult: <b>${result.toUpperCase()}</b>\nP&L: <b>$${pnl.toFixed(2)}</b>\nBankroll: <b>$${state.bankroll.toFixed(2)}</b>`);
+        push(`${emoji} Resolved: ${pos.pick} (${pos.event}) → ${result} | P&L: $${pnl.toFixed(2)}${lossReason ? ` | ${lossReason}` : ""}`);
+        const lossLine = lossReason ? `\n📝 <i>${lossReason}</i>` : "";
+        await sendTG(`${emoji} <b>BET RESOLVED</b>\n\n${pos.event}\nPick: <b>${pos.pick}</b>\nResult: <b>${result.toUpperCase()}</b>\nP&L: <b>$${pnl.toFixed(2)}</b>\nBankroll: <b>$${state.bankroll.toFixed(2)}</b>${lossLine}`);
       } else {
         stillOpen.push(pos);
       }
@@ -472,7 +589,7 @@ async function runBot() {
         if (currentDeployed / state.bankroll * 100 >= MAX_DEPLOYED_PCT) break;
 
         const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence);
+        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1);
 
         if (betSize > state.bankroll - currentDeployed) continue;
 
@@ -498,8 +615,10 @@ async function runBot() {
           matchTime: a.opp.match.scheduled_at,
           formA: a.pred.recordA,
           formB: a.pred.recordB,
+          thesis: a.pred.thesis || "",
           polyUrl: a.opp.polyOdds.polyUrl || null,
           polyLiquidity: a.opp.polyOdds.liquidity,
+          matchStatus: "upcoming",
         };
 
         state.openPositions.push(position);
@@ -521,6 +640,7 @@ async function runBot() {
           `Edge: <b>+${position.edge}%</b>\n` +
           `Confidence: ${position.confidence}\n` +
           `Liquidity: $${position.polyLiquidity.toFixed(0)}\n\n` +
+          `📝 <i>${position.thesis}</i>\n\n` +
           `💵 Bet: <b>$${betSize}</b> (${position.betPercent}% of bankroll)\n` +
           `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n` +
           `📊 Open positions: ${state.openPositions.length}/${MAX_POSITIONS}\n\n` +
@@ -534,10 +654,48 @@ async function runBot() {
       else if (state.bankroll <= MIN_BET) push("⏸️ Bankroll too low");
     }
 
-    // 4. Save state
+    // 4. Update match status on open positions
+    for (const pos of state.openPositions) {
+      const matchTime = new Date(pos.matchTime);
+      if (now > matchTime) pos.matchStatus = "live";
+      else pos.matchStatus = "upcoming";
+    }
+
+    // 5. Save state
     state.lastRunAt = now.toISOString();
     state.totalRuns = (state.totalRuns || 0) + 1;
     state.closedPositions = (state.closedPositions || []).slice(0, 500);
+
+    // 6. Daily summary — send once per day around midnight UTC
+    const lastSummary = state.lastDailySummary ? new Date(state.lastDailySummary) : null;
+    const hourUTC = now.getUTCHours();
+    if (hourUTC === 23 && (!lastSummary || now.toDateString() !== lastSummary.toDateString())) {
+      const todayClosed = (state.closedPositions || []).filter(p => {
+        const d = new Date(p.resolvedAt);
+        return d.toDateString() === now.toDateString();
+      });
+      const todayPnl = todayClosed.reduce((s, p) => s + (p.pnl || 0), 0);
+      const todayWins = todayClosed.filter(p => p.result === "win").length;
+      const todayLosses = todayClosed.filter(p => p.result === "loss").length;
+      const totalPnl = state.bankroll - state.initialBankroll;
+      const allClosed = state.closedPositions || [];
+      const allWins = allClosed.filter(p => p.result === "win").length;
+      const allLosses = allClosed.filter(p => p.result === "loss").length;
+
+      await sendTG(
+        `📊 <b>DAILY SUMMARY</b> — ${now.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })}\n\n` +
+        `<b>Today:</b>\n` +
+        `   ${todayWins}W - ${todayLosses}L | P&L: ${todayPnl >= 0 ? "+" : ""}$${todayPnl.toFixed(2)}\n` +
+        (todayClosed.length > 0 ? todayClosed.map(p => `   ${p.result === "win" ? "✅" : "❌"} ${p.pick} (${p.event}) ${p.pnl >= 0 ? "+" : ""}$${p.pnl.toFixed(2)}`).join("\n") + "\n" : "   No bets resolved today\n") +
+        `\n<b>All-Time:</b>\n` +
+        `   ${allWins}W - ${allLosses}L (${allWins + allLosses > 0 ? (allWins / (allWins + allLosses) * 100).toFixed(0) : 0}% hit rate)\n` +
+        `   P&L: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)} (${(totalPnl / state.initialBankroll * 100).toFixed(1)}% ROI)\n` +
+        `   Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n` +
+        `   Open: ${state.openPositions.length} positions\n\n` +
+        `🔄 ${state.totalRuns} total runs today`
+      );
+      state.lastDailySummary = now.toISOString();
+    }
 
     saveState(state);
 
@@ -667,7 +825,8 @@ async function handleTelegramCommand(text) {
         livePnlStr = `${sign}$${livePnl.toFixed(2)}`;
       }
 
-      msg += `${i + 1}. <b>${game}</b> — ${p.event}\n`;
+      const statusEmoji = p.matchStatus === "live" ? "🔴 LIVE" : "⏰ Upcoming";
+      msg += `${i + 1}. <b>${game}</b> — ${p.event} [${statusEmoji}]\n`;
       msg += `   Pick: <b>${p.pick}</b> | $${p.betSize} bet\n`;
       msg += `   Entry: ${p.marketProb}%`;
       if (liveProb !== null) {
@@ -679,6 +838,7 @@ async function handleTelegramCommand(text) {
       if (livePnlStr) msg += `   Live P&L: <b>${livePnlStr}</b>\n`;
       msg += `   ${p.league} · BO${p.format} · ${matchDate} UTC\n`;
       if (p.polyLiquidity) msg += `   💧 Liquidity: $${p.polyLiquidity.toFixed(0)}\n`;
+      if (p.thesis) msg += `   📝 <i>${p.thesis}</i>\n`;
       msg += `   🔗 <a href="${link}">View on Polymarket</a>\n\n`;
     }
 
@@ -780,10 +940,66 @@ async function handleTelegramCommand(text) {
     }
   }
 
+  if (cmd === "/summary") {
+    const closed = state.closedPositions || [];
+    const open = state.openPositions || [];
+    const totalPnl = state.bankroll - (state.initialBankroll || 1000);
+    const allWins = closed.filter(p => p.result === "win").length;
+    const allLosses = closed.filter(p => p.result === "loss").length;
+
+    // Bot vs Market accuracy
+    let botRight = 0, mktRight = 0;
+    closed.forEach(p => {
+      const botSaysWin = p.ourProb > 50;
+      const mktSaysWin = p.marketProb > 50;
+      const actualWin = p.result === "win";
+      if (botSaysWin === actualWin) botRight++;
+      if (mktSaysWin === actualWin) mktRight++;
+    });
+
+    // Loss reasons breakdown
+    const reasons = {};
+    closed.filter(p => p.lossReason).forEach(p => {
+      reasons[p.lossReason] = (reasons[p.lossReason] || 0) + 1;
+    });
+
+    let msg = `📊 <b>FULL SUMMARY</b>\n\n`;
+    msg += `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n`;
+    msg += `💰 P&L: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b> (${(totalPnl / (state.initialBankroll || 1000) * 100).toFixed(1)}% ROI)\n`;
+    msg += `🎯 Record: <b>${allWins}W - ${allLosses}L</b> (${allWins + allLosses > 0 ? (allWins / (allWins + allLosses) * 100).toFixed(0) : 0}%)\n\n`;
+
+    if (closed.length > 0) {
+      msg += `🤖 <b>BOT vs MARKET</b>\n`;
+      msg += `   Bot correct: ${botRight}/${closed.length} (${(botRight / closed.length * 100).toFixed(0)}%)\n`;
+      msg += `   Market correct: ${mktRight}/${closed.length} (${(mktRight / closed.length * 100).toFixed(0)}%)\n\n`;
+    }
+
+    if (Object.keys(reasons).length > 0) {
+      msg += `📝 <b>LOSS REASONS</b>\n`;
+      Object.entries(reasons).sort((a, b) => b[1] - a[1]).forEach(([reason, count]) => {
+        msg += `   ${count}x — ${reason}\n`;
+      });
+      msg += "\n";
+    }
+
+    // Recent trades
+    const recent5 = closed.slice(0, 5);
+    if (recent5.length > 0) {
+      msg += `📋 <b>LAST 5 TRADES</b>\n`;
+      recent5.forEach(p => {
+        const emoji = p.result === "win" ? "✅" : "❌";
+        msg += `   ${emoji} ${p.pick} (${p.event}) ${p.pnl >= 0 ? "+" : ""}$${p.pnl.toFixed(2)}\n`;
+      });
+    }
+
+    return msg;
+  }
+
   if (cmd === "/help") {
     return `🤖 <b>Edge Terminal Bot</b>\n\n` +
-      `/trades — View open positions with live prices\n` +
+      `/trades — Open positions with live prices + thesis\n` +
       `/status — Bankroll, P&L, win rate\n` +
+      `/summary — Full analytics + bot vs market\n` +
       `/run — Trigger a bot run now\n` +
       `/deploy — Pull latest code + restart\n` +
       `/cancel — Cancel all open positions\n` +
