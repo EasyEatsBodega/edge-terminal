@@ -151,11 +151,25 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
         const volume = parseFloat(mkt.volume) || 0;
         const slug = mkt.slug || "";
         const polyUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+
+        // Spread: how far apart are the two outcome prices? Tight = confident market.
+        const spread = Math.abs(probFirst - probSecond);
+
+        // Market freshness: how recently was this market updated?
+        const updatedAt = mkt.updated_at || mkt.lastTradeTimestamp || null;
+        const hoursSinceUpdate = updatedAt ? (Date.now() - new Date(updatedAt).getTime()) / 3600000 : null;
+
+        // Volume quality: higher volume = more reliable pricing
+        const volumePerLiq = liquidity > 0 ? volume / liquidity : 0;
+
         return {
           probA: aIsFirst ? probFirst : probSecond,
           probB: aIsFirst ? probSecond : probFirst,
           liquidity,
           volume,
+          spread,
+          hoursSinceUpdate,
+          volumePerLiq,
           slug,
           polyUrl,
         };
@@ -307,6 +321,11 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
   const trajA = formTrajectory(rA);
   const trajB = formTrajectory(rB);
 
+  // Rustiness — if a team hasn't played recently, pull their form toward 50%
+  // A team with no matches in 14+ days is an unknown quantity
+  const rustA = rA.length > 0 && rA[0].daysAgo > 14 ? Math.min((rA[0].daysAgo - 14) / 14, 1) * 0.15 : 0;
+  const rustB = rB.length > 0 && rB[0].daysAgo > 14 ? Math.min((rB[0].daysAgo - 14) / 14, 1) * 0.15 : 0;
+
   // ─── Composite score ─────────────────────────────────────────────────
   const fw = weights.form || 0.40;
   const sw = 0.20;
@@ -325,18 +344,27 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
   prob += (clutchA - clutchB) * 0.3;            // Clutch performance in close matches
   prob += (trajA - trajB) * 0.4;                // Form trajectory (improving vs declining)
 
+  // Rustiness penalty — pull toward 50% if team hasn't played recently
+  // rustA/B range 0 to 0.15. If A is rusty, their predicted strength fades toward 50%.
+  if (rustA > 0) prob = prob * (1 - rustA) + 50 * rustA;
+  if (rustB > 0) prob = prob * (1 - rustB) + 50 * rustB;  // Rusty opponent = pull our edge back
+
   // BO format adjustment — BO1 is volatile, BO3+ rewards better team
   const bo = format || 1;
   if (bo === 1) prob = prob * 0.75 + 50 * 0.25;
   else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;
 
   prob = Math.max(5, Math.min(95, prob));
-  const confidence = Math.min(rA.length, rB.length) >= 8 ? "high" : Math.min(rA.length, rB.length) >= 4 ? "medium" : "low";
+
+  // Confidence: downgrade if either team is rusty
+  const maxRust = Math.max(rustA, rustB);
+  let confidence = Math.min(rA.length, rB.length) >= 8 ? "high" : Math.min(rA.length, rB.length) >= 4 ? "medium" : "low";
+  if (maxRust > 0.05 && confidence === "high") confidence = "medium";  // Rusty team = less certain
 
   const thesis = buildThesis(
     rA, rB, formA, formB, strengthA, strengthB, allA, allB,
     h2h, streakA, streakB, bo, prob,
-    teamAId, teamBId, domA, domB, clutchA, clutchB, trajA, trajB
+    teamAId, teamBId, domA, domB, clutchA, clutchB, trajA, trajB, rustA, rustB
   );
 
   return {
@@ -357,7 +385,7 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 
 // ─── Thesis Generator — plain English reasoning for each bet ────────────────
 
-function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA, streakB, bo, prob, teamAId, teamBId, domA = 0, domB = 0, clutchA = 0, clutchB = 0, trajA = 0, trajB = 0) {
+function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA, streakB, bo, prob, teamAId, teamBId, domA = 0, domB = 0, clutchA = 0, clutchB = 0, trajA = 0, trajB = 0, rustA = 0, rustB = 0) {
   const parts = [];
   const fav = prob > 50 ? "A" : "B";
   const favForm = fav === "A" ? formA : formB;
@@ -411,6 +439,10 @@ function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA,
   if (streakA < 0) parts.push("Team A on 3L cold streak");
   if (streakB > 0) parts.push("Team B on 3W hot streak");
   if (streakB < 0) parts.push("Team B on 3L cold streak");
+
+  // Rustiness
+  if (rustA > 0.05) parts.push(`Team A hasn't played in ${rA[0]?.daysAgo?.toFixed(0) || "14+"}d — rust factor`);
+  if (rustB > 0.05) parts.push(`Team B hasn't played in ${rB[0]?.daysAgo?.toFixed(0) || "14+"}d — rust factor`);
 
   // Format
   if (bo === 1) parts.push("BO1 increases upset risk significantly");
@@ -742,6 +774,12 @@ async function runBot() {
 
         // FILTER: Skip low-liquidity markets — prices are meaningless without real money behind them
         if (polyOdds.liquidity < MIN_LIQUIDITY) {
+          skippedLowLiq++;
+          continue;
+        }
+
+        // FILTER: Skip stale markets — if not updated in 2+ hours, prices may be unreliable
+        if (polyOdds.hoursSinceUpdate !== null && polyOdds.hoursSinceUpdate > 2) {
           skippedLowLiq++;
           continue;
         }
