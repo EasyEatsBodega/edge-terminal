@@ -258,7 +258,7 @@ const calcKelly = (prob, impliedProb) => {
 export default function App() {
   const [pandaKey, setPandaKey] = useState(() => load("pandaKey", ""));
   const [keyInput, setKeyInput] = useState(() => load("pandaKey", ""));
-  const [view, setView] = useState("predictions"); // predictions | log | bot | settings
+  const [view, setView] = useState("bot"); // bot | predictions | log | settings
   const [gameFilter, setGameFilter] = useState("all"); // all | csgo | dota2 | lol
   const [sortBy, setSortBy] = useState("time"); // time | edge
   const [expandedMatch, setExpandedMatch] = useState(null);
@@ -277,10 +277,10 @@ export default function App() {
   // Bot state — connects to VPS bot server
   const [botState, setBotState] = useState(null);
   const [botLoading, setBotLoading] = useState(false);
-  const [botSecret, setBotSecret] = useState(() => load("botSecret", ""));
-  const [botSecretInput, setBotSecretInput] = useState(() => load("botSecret", ""));
-  const [botUrl, setBotUrl] = useState(() => load("botUrl", ""));
-  const [botUrlInput, setBotUrlInput] = useState(() => load("botUrl", ""));
+  const [botSecret, setBotSecret] = useState(() => load("botSecret", "") || "edgeterminal2026");
+  const [botSecretInput, setBotSecretInput] = useState(() => load("botSecret", "") || "edgeterminal2026");
+  const [botUrl, setBotUrl] = useState(() => load("botUrl", "") || "http://142.93.228.49:3069");
+  const [botUrlInput, setBotUrlInput] = useState(() => load("botUrl", "") || "http://142.93.228.49:3069");
   const [botRunning, setBotRunning] = useState(false);
 
   const loadBotState = useCallback(async () => {
