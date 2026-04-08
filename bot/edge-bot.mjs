@@ -31,17 +31,34 @@ const CFG = loadConfig();
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INITIAL_BANKROLL = 1000;
-const MAX_DEPLOYED_PCT = 40;         // Deploy more capital — we're taking high-prob picks
-const MAX_POSITIONS = 10;
-const MIN_EDGE = 3;                  // Lower edge threshold — if we're 65%+ confident, 3% edge is fine
-const MAX_BET_PCT = 10;              // Bigger bets on high-confidence plays
-const MIN_BET = 10;
-const BET_WINDOW_MIN_H = 0.25;
-const BET_WINDOW_MAX_H = 12;         // Wider window — more games to pick from
-const MIN_LIQUIDITY = 500;           // Lower liq floor — more markets available
-const MIN_OUR_PROB = 60;             // Only bet when model says 60%+ to WIN — high likelihood plays
-const BETS_PER_RUN = 5;              // Take up to 5 plays per run — more action
-const HIGH_CONF_PROB = 70;           // 70%+ model probability = size up aggressively
+const MAX_DEPLOYED_PCT = 20;         // Conservative — protect remaining bankroll
+const MAX_POSITIONS = 5;             // Fewer concurrent bets = less correlated risk
+const MIN_EDGE = 5;                  // Need real edge vs market, not 3% noise
+const MAX_BET_PCT = 5;               // Smaller max bet — survival first
+const MIN_BET = 5;
+const BET_WINDOW_MIN_H = 0.5;       // 30min minimum — need settled odds
+const BET_WINDOW_MAX_H = 6;          // Tighter window — odds more reliable closer to match
+const MIN_LIQUIDITY = 2000;          // Real liquidity only — thin markets = bad prices
+const MIN_OUR_PROB = 60;             // Keep — only bet confident picks
+const BETS_PER_RUN = 2;              // Quality over quantity — max 2 bets per run
+const PRICE_DISCOVERY_MIN = 58;      // Market must show some signal (not coin-flip territory)
+
+// ─── Market Confirmation Mode ──────────────────────────────────────────────
+// When model AND market agree on a heavy favorite, take a small position.
+// Esports markets tend to underprice favorites (degen bettors love underdogs).
+const CONFIRM_ENABLED = true;
+const CONFIRM_MIN_MARKET_PROB = 72;  // Market must see team as 72%+ favorite
+const CONFIRM_MIN_OUR_PROB = 70;     // Our model must also agree (70%+)
+const CONFIRM_MAX_BET_PCT = 2;       // Tiny bets — grinding small wins, not swinging
+const CONFIRM_MIN_LIQUIDITY = 3000;  // Higher liquidity required — need reliable prices
+const CONFIRM_MAX_PER_RUN = 1;       // Max 1 confirmation bet per run
+
+// ─── Drawdown Protection ───────────────────────────────────────────────────
+
+const DRAWDOWN_HALT_PCT = 50;        // Stop betting if bankroll drops below 50% of initial
+const DRAWDOWN_SURVIVAL_PCT = 70;    // Enter survival mode below 70% (half sizing)
+const MAX_CONSEC_LOSSES = 3;         // After 3 consecutive losses, halve sizing
+const COOLDOWN_AFTER_LOSS_STREAK = 2; // Skip N runs after hitting loss streak limit
 
 // ─── File-Based State ───────────────────────────────────────────────────────
 
@@ -147,28 +164,54 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
   return null;
 }
 
-// ─── Prediction Model (v2 — opponent strength + aggressive recency) ─────────
+// ─── Prediction Model (v3 — game scores, margins, dominance + recency) ─────
 
 function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
-  // Extract results with opponent info and match metadata
+  // Extract rich results — game scores, margins, not just W/L
   const getResults = (history, teamId) =>
-    history.map(m => ({
-      won: m.winner?.id === teamId,
-      oppId: m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent?.id,
-      oppName: m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent?.name || "?",
-      date: m.scheduled_at || m.begin_at,
-      bo: m.number_of_games || 1,
-      league: m.league?.name || "",
-      tournamentTier: m.tournament?.tier || "unranked",
-    })).filter(r => r.oppId !== undefined);
+    history.map(m => {
+      const teamResult = m.results?.find(r => r.team_id === teamId);
+      const oppResult = m.results?.find(r => r.team_id !== teamId);
+      const opp = m.opponents?.find(o => o.opponent?.id !== teamId)?.opponent;
 
-  // Aggressive recency — last 5 matches weighted MUCH heavier than 6-10
+      // Game-level scores (e.g., 2-1 in BO3, 16-12 in CS2 maps)
+      const gamesWon = teamResult?.score || 0;
+      const gamesLost = oppResult?.score || 0;
+      const totalGames = gamesWon + gamesLost;
+
+      // Dominance: how convincingly did they win/lose?
+      // 2-0 win = dominance 1.0, 2-1 win = 0.5, 0-2 loss = -1.0, 1-2 loss = -0.5
+      let dominance = 0;
+      if (totalGames > 0) {
+        dominance = (gamesWon - gamesLost) / Math.max(totalGames, 1);
+      }
+
+      // Match recency in days (for time-decay)
+      const matchDate = new Date(m.scheduled_at || m.begin_at);
+      const daysAgo = (Date.now() - matchDate.getTime()) / 86400000;
+
+      return {
+        won: m.winner?.id === teamId,
+        oppId: opp?.id,
+        oppName: opp?.name || "?",
+        date: m.scheduled_at || m.begin_at,
+        daysAgo,
+        bo: m.number_of_games || 1,
+        gamesWon,
+        gamesLost,
+        dominance,        // -1 to +1: how convincing the result was
+        league: m.league?.name || "",
+        tournamentTier: m.tournament?.tier || "unranked",
+      };
+    }).filter(r => r.oppId !== undefined);
+
+  // Recent form — exponential decay + dominance weighting
+  // A 2-0 stomp counts more than a 2-1 scrape
   const recentFormWR = (results, n = 10) => {
     const recent = results.slice(0, n);
     if (!recent.length) return 50;
     let tw = 0, ww = 0;
     recent.forEach((r, i) => {
-      // Exponential decay — match 0 has weight 1.0, match 9 has weight ~0.13
       const w = Math.pow(0.8, i);
       tw += w;
       if (r.won) ww += w;
@@ -176,13 +219,36 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
     return tw > 0 ? (ww / tw) * 100 : 50;
   };
 
+  // Dominance score — average dominance across recent matches
+  // Positive = winning convincingly, negative = losing badly or barely winning
+  const dominanceScore = (results, n = 10) => {
+    const recent = results.slice(0, n);
+    if (!recent.length) return 0;
+    let tw = 0, dw = 0;
+    recent.forEach((r, i) => {
+      const w = Math.pow(0.85, i);
+      tw += w;
+      dw += r.dominance * w;
+    });
+    return tw > 0 ? dw / tw : 0;
+  };
+
+  // Close-match performance — how do they perform in tight games?
+  // Teams that win close matches (2-1, 13-16) are more clutch
+  const clutchFactor = (results) => {
+    const recent = results.slice(0, 15);
+    const closeMatches = recent.filter(r => Math.abs(r.dominance) <= 0.4 && r.bo >= 3);
+    if (closeMatches.length < 2) return 0;
+    const closeWins = closeMatches.filter(r => r.won).length;
+    // Return -5 to +5 range
+    return ((closeWins / closeMatches.length) - 0.5) * 10;
+  };
+
   // Opponent-strength-adjusted win rate — wins vs tough opponents count more
   const strengthAdjustedWR = (results) => {
     if (!results.length) return 50;
-    // Count how many of each opponent's other results were wins (proxy for strength)
     let tw = 0, ww = 0;
     results.forEach(r => {
-      // Tier-based strength multiplier
       const tierMult = r.tournamentTier === "s" ? 1.5 : r.tournamentTier === "a" ? 1.3 : r.tournamentTier === "b" ? 1.1 : 1.0;
       tw += tierMult;
       if (r.won) ww += tierMult;
@@ -201,14 +267,24 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
     return { wr: (meetings.filter(r => r.won).length / meetings.length) * 100, n: meetings.length };
   };
 
-  // Hot/cold streak detection — last 3 matches
+  // Hot/cold streak with momentum direction
   const streakFactor = (results) => {
     const last3 = results.slice(0, 3);
     if (last3.length < 3) return 0;
     const wins = last3.filter(r => r.won).length;
-    if (wins === 3) return 4;   // Hot streak bonus
-    if (wins === 0) return -4;  // Cold streak penalty
+    if (wins === 3) return 4;
+    if (wins === 0) return -4;
     return 0;
+  };
+
+  // Form trajectory — is the team improving or declining?
+  // Compare last 5 matches to matches 6-10
+  const formTrajectory = (results) => {
+    if (results.length < 8) return 0;
+    const recent5WR = results.slice(0, 5).filter(r => r.won).length / 5;
+    const prev5WR = results.slice(5, 10).filter(r => r.won).length / Math.min(5, results.slice(5, 10).length);
+    // Positive = improving, negative = declining, range roughly -3 to +3
+    return (recent5WR - prev5WR) * 6;
   };
 
   const rA = getResults(histA, teamAId);
@@ -223,9 +299,16 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
   const h2h = h2hWR(rA, teamBId);
   const streakA = streakFactor(rA);
   const streakB = streakFactor(rB);
+  const domA = dominanceScore(rA, 10);
+  const domB = dominanceScore(rB, 10);
+  const clutchA = clutchFactor(rA);
+  const clutchB = clutchFactor(rB);
+  const trajA = formTrajectory(rA);
+  const trajB = formTrajectory(rB);
 
+  // ─── Composite score ─────────────────────────────────────────────────
   const fw = weights.form || 0.40;
-  const sw = 0.20; // opponent strength weight
+  const sw = 0.20;
   const ow = weights.overall || 0.25;
   const hw = h2h.n >= 3 ? (weights.h2h || 0.15) : 0.05;
   const owAdj = ow + ((weights.h2h || 0.15) - hw);
@@ -235,22 +318,24 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 
   let prob = (sA + sB) > 0 ? (sA / (sA + sB)) * 100 : 50;
 
-  // Apply streak adjustment
-  prob += (streakA - streakB) * 0.5;
+  // Apply adjustments from richer data
+  prob += (streakA - streakB) * 0.5;            // Streak momentum
+  prob += (domA - domB) * 3;                     // Dominance: winning 2-0 vs 2-1 matters
+  prob += (clutchA - clutchB) * 0.3;            // Clutch performance in close matches
+  prob += (trajA - trajB) * 0.4;                // Form trajectory (improving vs declining)
 
   // BO format adjustment — BO1 is volatile, BO3+ rewards better team
   const bo = format || 1;
-  if (bo === 1) prob = prob * 0.82 + 50 * 0.18;  // Stronger pull to 50% for BO1
-  else if (bo >= 5) prob = 50 + (prob - 50) * 1.12;
+  if (bo === 1) prob = prob * 0.75 + 50 * 0.25;
+  else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;
 
   prob = Math.max(5, Math.min(95, prob));
   const confidence = Math.min(rA.length, rB.length) >= 8 ? "high" : Math.min(rA.length, rB.length) >= 4 ? "medium" : "low";
 
-  // Build thesis (plain English reasoning)
   const thesis = buildThesis(
     rA, rB, formA, formB, strengthA, strengthB, allA, allB,
     h2h, streakA, streakB, bo, prob,
-    teamAId, teamBId
+    teamAId, teamBId, domA, domB, clutchA, clutchB, trajA, trajB
   );
 
   return {
@@ -260,6 +345,9 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
     overallA: allA, overallB: allB,
     h2hWR: h2h.wr, h2hN: h2h.n,
     streakA, streakB,
+    dominanceA: domA, dominanceB: domB,
+    clutchA, clutchB,
+    trajectoryA: trajA, trajectoryB: trajB,
     recordA: `${rA.filter(r => r.won).length}-${rA.filter(r => !r.won).length}`,
     recordB: `${rB.filter(r => r.won).length}-${rB.filter(r => !r.won).length}`,
     dataPointsA: rA.length, dataPointsB: rB.length,
@@ -268,12 +356,11 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights) {
 
 // ─── Thesis Generator — plain English reasoning for each bet ────────────────
 
-function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA, streakB, bo, prob, teamAId, teamBId) {
+function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA, streakB, bo, prob, teamAId, teamBId, domA = 0, domB = 0, clutchA = 0, clutchB = 0, trajA = 0, trajB = 0) {
   const parts = [];
   const fav = prob > 50 ? "A" : "B";
   const favForm = fav === "A" ? formA : formB;
   const dogForm = fav === "A" ? formB : formA;
-  const favStr = fav === "A" ? strA : strB;
 
   // Form analysis
   const formDiff = Math.abs(formA - formB);
@@ -285,10 +372,31 @@ function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA,
     parts.push(`Similar form (${formA.toFixed(0)}% vs ${formB.toFixed(0)}%)`);
   }
 
+  // Dominance — are they winning convincingly?
+  const domDiff = domA - domB;
+  if (Math.abs(domDiff) > 0.3) {
+    const dominant = domDiff > 0 ? "A" : "B";
+    parts.push(`Team ${dominant} winning more convincingly (dominant in game scores)`);
+  }
+
+  // Trajectory — improving or declining?
+  if (Math.abs(trajA) > 1.5 || Math.abs(trajB) > 1.5) {
+    if (trajA > 1.5) parts.push("Team A trending up (recent form improving)");
+    if (trajA < -1.5) parts.push("Team A trending down (form declining)");
+    if (trajB > 1.5) parts.push("Team B trending up (recent form improving)");
+    if (trajB < -1.5) parts.push("Team B trending down (form declining)");
+  }
+
   // Strength-adjusted
   if (Math.abs(strA - strB) > 10) {
     const betterStr = strA > strB ? "A" : "B";
-    parts.push(`${betterStr === "A" ? "Team A" : "Team B"} wins against tougher opponents`);
+    parts.push(`Team ${betterStr} wins against tougher opponents`);
+  }
+
+  // Clutch factor
+  if (Math.abs(clutchA - clutchB) > 3) {
+    const clutcher = clutchA > clutchB ? "A" : "B";
+    parts.push(`Team ${clutcher} better in close matches`);
   }
 
   // H2H
@@ -310,24 +418,59 @@ function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA,
   return parts.join(". ") + ".";
 }
 
+// ─── Drawdown Detection ────────────────────────────────────────────────────
+
+function getDrawdownState(state) {
+  const bankrollPct = (state.bankroll / state.initialBankroll) * 100;
+  const closed = state.closedPositions || [];
+
+  // Count consecutive losses from most recent
+  let consecLosses = 0;
+  for (const p of closed) {
+    if (p.result === "loss") consecLosses++;
+    else break;
+  }
+
+  // Check if we should halt entirely
+  const halted = bankrollPct <= DRAWDOWN_HALT_PCT;
+
+  // Check if we're in survival mode
+  const survival = bankrollPct <= DRAWDOWN_SURVIVAL_PCT;
+
+  // Check if on a bad loss streak — apply cooldown
+  const onCooldown = consecLosses >= MAX_CONSEC_LOSSES &&
+    state.runsSinceLossStreak !== undefined &&
+    state.runsSinceLossStreak < COOLDOWN_AFTER_LOSS_STREAK;
+
+  // Sizing multiplier based on drawdown
+  let sizeMult = 1.0;
+  if (survival) sizeMult = 0.5;                     // Half size in survival mode
+  if (consecLosses >= MAX_CONSEC_LOSSES) sizeMult *= 0.5;  // Half again on loss streak
+
+  return { bankrollPct, consecLosses, halted, survival, onCooldown, sizeMult };
+}
+
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
 
-function calcBetSize(edge, bankroll, confidence, format = 3, ourProb = 50) {
+function calcBetSize(edge, bankroll, confidence, format = 3, drawdownMult = 1.0) {
+  // Quarter-Kelly base — conservative fractional Kelly
   const kellyFull = edge / 100 * bankroll;
-  let fraction;
-  if (edge >= 8) fraction = 1.0;
-  else if (edge >= 5) fraction = 0.75;
-  else fraction = 0.5;
+  let fraction = 0.25;
 
-  if (confidence === "low") fraction *= 0.5;
-  else if (confidence === "medium") fraction *= 0.75;
+  // Scale up slightly for strong edges, but cap conservatively
+  if (edge >= 10) fraction = 0.5;
+  else if (edge >= 7) fraction = 0.4;
+  else if (edge >= 5) fraction = 0.3;
 
-  // HIGH PROBABILITY BOOST — if model is 70%+ confident, size up
-  if (ourProb >= HIGH_CONF_PROB) fraction *= 1.5;
-  else if (ourProb >= 65) fraction *= 1.2;
+  // Confidence penalty — less data = smaller bets
+  if (confidence === "low") fraction *= 0.4;
+  else if (confidence === "medium") fraction *= 0.7;
 
-  // BO1 penalty — reduce bet size due to high variance
-  if (format === 1) fraction *= 0.6;  // Less harsh than before (was 0.5)
+  // BO1 penalty — high variance format
+  if (format === 1) fraction *= 0.5;
+
+  // Apply drawdown multiplier (from getDrawdownState)
+  fraction *= drawdownMult;
 
   let size = Math.round(kellyFull * fraction);
   size = Math.max(MIN_BET, size);
@@ -339,31 +482,34 @@ function calcBetSize(edge, bankroll, confidence, format = 3, ourProb = 50) {
 
 function adjustWeights(state) {
   const closed = state.closedPositions || [];
-  if (closed.length < 10) return state.modelWeights;
+  if (closed.length < 4) return state.modelWeights;  // Start adjusting after just 4 trades
 
-  const recent = closed.slice(0, 30);
-  let overconfident = 0;
-
-  recent.forEach(p => {
-    const predicted = p.pickSide === "A" ? p.ourProb : 100 - p.ourProb;
-    if (predicted > 60 && p.result === "loss") overconfident++;
-  });
-
+  const recent = closed.slice(0, 20);
   const total = recent.length;
   const wins = recent.filter(p => p.result === "win").length;
-  const actualHitRate = wins / total;
+  const losses = total - wins;
+  const hitRate = wins / total;
   const weights = { ...state.modelWeights };
 
-  if (overconfident / total > 0.3) {
-    weights.form = Math.max(0.25, weights.form - 0.03);
-    weights.overall = Math.min(0.45, weights.overall + 0.02);
-    weights.h2h = Math.min(0.25, weights.h2h + 0.01);
+  // Count overconfident losses (model said 60%+ but lost)
+  let overconfident = 0;
+  recent.forEach(p => {
+    if (p.ourProb > 55 && p.result === "loss") overconfident++;
+  });
+
+  // If more than 25% of recent picks are overconfident losses, reduce form reliance
+  if (total >= 4 && overconfident / total > 0.25) {
+    weights.form = Math.max(0.20, weights.form - 0.05);
+    weights.overall = Math.min(0.50, weights.overall + 0.03);
+    weights.h2h = Math.min(0.30, weights.h2h + 0.02);
   }
 
-  if (actualHitRate > 0.6) {
-    weights.form = Math.min(0.55, weights.form + 0.01);
+  // If winning, lean back into form
+  if (hitRate > 0.55 && total >= 6) {
+    weights.form = Math.min(0.55, weights.form + 0.02);
   }
 
+  // Normalize weights to sum to ~0.95 (remaining 0.05 is implicit strength weight)
   const sum = weights.form + weights.overall + weights.h2h;
   if (sum > 0) {
     const scale = 0.95 / sum;
@@ -373,6 +519,21 @@ function adjustWeights(state) {
   }
 
   return weights;
+}
+
+// Circuit breaker — should we stop betting entirely?
+function shouldCircuitBreak(state) {
+  const closed = state.closedPositions || [];
+  if (closed.length < 4) return false;
+
+  const recent = closed.slice(0, 10);
+  const wins = recent.filter(p => p.result === "win").length;
+  const hitRate = wins / recent.length;
+
+  // If win rate is below 20% over last 10, stop
+  if (recent.length >= 6 && hitRate < 0.20) return true;
+
+  return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -480,7 +641,7 @@ async function runBot() {
     }
     state.openPositions = stillOpen;
 
-    if (resolvedCount > 0 && state.closedPositions.length >= 10) {
+    if (resolvedCount > 0 && state.closedPositions.length >= 4) {
       const newWeights = adjustWeights(state);
       if (JSON.stringify(newWeights) !== JSON.stringify(state.modelWeights)) {
         push(`🧠 Model weights adjusted: form=${newWeights.form.toFixed(2)} overall=${newWeights.overall.toFixed(2)} h2h=${newWeights.h2h.toFixed(2)}`);
@@ -488,16 +649,51 @@ async function runBot() {
       }
     }
 
+    // ─── Drawdown & Circuit Breaker Checks ────────────────────────────────
+    const dd = getDrawdownState(state);
+
+    if (dd.halted) {
+      push(`🛑 HALTED — Bankroll at ${dd.bankrollPct.toFixed(1)}% of initial (below ${DRAWDOWN_HALT_PCT}%). No new bets until manual review.`);
+      await sendTG(`🛑 <b>BOT HALTED</b>\n\nBankroll dropped to <b>${dd.bankrollPct.toFixed(1)}%</b> of initial.\nNo new bets will be placed.\nUse /reset or manually adjust to resume.`);
+      saveState(state);
+      return { ok: true, log };
+    }
+
+    if (shouldCircuitBreak(state)) {
+      push(`⚡ CIRCUIT BREAKER — Win rate too low. Pausing new bets.`);
+      await sendTG(`⚡ <b>CIRCUIT BREAKER</b>\n\nWin rate critically low over recent trades.\nPausing new bets until performance improves.`);
+      saveState(state);
+      return { ok: true, log };
+    }
+
+    // Track cooldown after loss streaks
+    if (dd.consecLosses >= MAX_CONSEC_LOSSES) {
+      state.runsSinceLossStreak = (state.runsSinceLossStreak || 0) + 1;
+      if (dd.onCooldown) {
+        push(`❄️ COOLDOWN — ${dd.consecLosses} consecutive losses. Skipping ${COOLDOWN_AFTER_LOSS_STREAK - state.runsSinceLossStreak + 1} more runs.`);
+        saveState(state);
+        return { ok: true, log };
+      }
+    } else {
+      state.runsSinceLossStreak = 0;
+    }
+
+    if (dd.survival) {
+      push(`⚠️ SURVIVAL MODE — Bankroll at ${dd.bankrollPct.toFixed(1)}%. Half sizing active.`);
+    }
+    if (dd.consecLosses >= MAX_CONSEC_LOSSES) {
+      push(`⚠️ LOSS STREAK — ${dd.consecLosses} consecutive losses. Reduced sizing.`);
+    }
+
     // 3. Find new opportunities
     const deployedPct = state.openPositions.reduce((s, p) => s + p.betSize, 0) / state.bankroll * 100;
     const canBet = state.openPositions.length < MAX_POSITIONS && deployedPct < MAX_DEPLOYED_PCT && state.bankroll > MIN_BET;
 
     if (canBet) {
-      // Fetch MORE matches per game to scan wider
       const [csgo, dota2, lol, polyMarkets] = await Promise.all([
-        pandaFetch("csgo/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
-        pandaFetch("dota2/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
-        pandaFetch("lol/matches/upcoming?per_page=50&sort=scheduled_at").catch(() => []),
+        pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
       ]);
 
@@ -532,9 +728,9 @@ async function runBot() {
           continue;
         }
 
-        // FILTER: Skip markets where both sides are dead even (45-55%) — need SOME signal
+        // FILTER: Skip coin-flip markets — need real price discovery signal
         const maxProb = Math.max(polyOdds.probA, polyOdds.probB);
-        if (maxProb < 53) {
+        if (maxProb < PRICE_DISCOVERY_MIN) {
           skippedLowLiq++;
           continue;
         }
@@ -562,7 +758,7 @@ async function runBot() {
           const edge = ourProb - marketProb;
 
           if (ourProb < MIN_OUR_PROB) continue;   // Must believe team wins (60%+)
-          if (edge < MIN_EDGE) continue;           // Must have edge vs market (3%+)
+          if (edge < MIN_EDGE) continue;           // Must have 5%+ edge vs market
           if (pred.confidence === "low" && ourProb < 65) continue;  // Low data? Need strong conviction
 
           analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
@@ -571,15 +767,15 @@ async function runBot() {
         }
       }
 
-      // RANK by win probability (highest first) — we want the BEST chance to WIN
-      analyzed.sort((a, b) => b.ourProb - a.ourProb);
+      // RANK by edge (highest first) — biggest market mispricing = best opportunity
+      analyzed.sort((a, b) => b.edge - a.edge);
 
       if (analyzed.length > 0) {
-        push(`🏆 ${analyzed.length} opportunities pass filters — top picks:`);
+        push(`🏆 ${analyzed.length} opportunities pass filters — ranked by edge:`);
         for (let i = 0; i < Math.min(analyzed.length, 5); i++) {
           const a = analyzed[i];
           const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-          push(`   ${i + 1}. ${pick} (${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}) — Model: ${a.ourProb.toFixed(1)}% | Market: ${a.marketProb.toFixed(1)}% | Edge: +${a.edge.toFixed(1)}% | Liq: $${a.opp.polyOdds.liquidity.toFixed(0)}`);
+          push(`   ${i + 1}. ${pick} (${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}) — Edge: +${a.edge.toFixed(1)}% | Model: ${a.ourProb.toFixed(1)}% | Market: ${a.marketProb.toFixed(1)}% | Liq: $${a.opp.polyOdds.liquidity.toFixed(0)}`);
         }
       } else {
         push("📭 No opportunities pass quality filters this run");
@@ -594,7 +790,7 @@ async function runBot() {
         if (currentDeployed / state.bankroll * 100 >= MAX_DEPLOYED_PCT) break;
 
         const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1, a.ourProb);
+        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1, dd.sizeMult);
 
         if (betSize > state.bankroll - currentDeployed) continue;
 
@@ -652,6 +848,107 @@ async function runBot() {
           `⏰ Match: ${new Date(position.matchTime).toLocaleString()}` +
           polyLink
         );
+      }
+
+      // ─── Market Confirmation Bets ───────────────────────────────────────
+      // When model AND market both agree on a heavy favorite, take a small position.
+      // Thesis: esports markets slightly underprice favorites because degen bettors
+      // love underdogs. If our model confirms the market's heavy favorite, the true
+      // probability is likely even higher than quoted.
+      if (CONFIRM_ENABLED && state.openPositions.length < MAX_POSITIONS) {
+        let confirmBets = 0;
+
+        for (const opp of opportunities) {
+          if (confirmBets >= CONFIRM_MAX_PER_RUN) break;
+          if (state.openPositions.length >= MAX_POSITIONS) break;
+          if (state.openPositions.some(p => p.matchId === opp.match.id)) continue;
+          if ((opp.polyOdds.liquidity || 0) < CONFIRM_MIN_LIQUIDITY) continue;
+
+          // Already placed an edge bet on this match?
+          if (betsPlaced.some(b => b.matchId === opp.match.id)) continue;
+
+          // Need to fetch prediction if not already analyzed
+          let pred;
+          const alreadyAnalyzed = analyzed.find(a => a.opp.match.id === opp.match.id);
+          if (alreadyAnalyzed) {
+            pred = alreadyAnalyzed.pred;
+          } else {
+            try {
+              const [histA, histB] = await Promise.all([
+                pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t1.id}&per_page=25&sort=-scheduled_at`),
+                pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t2.id}&per_page=25&sort=-scheduled_at`),
+              ]);
+              pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights);
+            } catch { continue; }
+          }
+
+          const pickSide = pred.probA >= pred.probB ? "A" : "B";
+          const ourProb = pickSide === "A" ? pred.probA : pred.probB;
+          const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
+
+          // Both model and market must agree this is a heavy favorite
+          if (marketProb < CONFIRM_MIN_MARKET_PROB) continue;
+          if (ourProb < CONFIRM_MIN_OUR_PROB) continue;
+          if (pred.confidence === "low") continue;  // Need decent data
+
+          // Tiny bet — grinding, not swinging
+          const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * CONFIRM_MAX_BET_PCT / 100));
+          const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
+          if (confirmSize > state.bankroll - currentDeployed) continue;
+
+          const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
+          const edge = ourProb - marketProb;
+
+          const position = {
+            id: `confirm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            matchId: opp.match.id,
+            game: opp.match._game,
+            teamA: opp.t1.acronym || opp.t1.name,
+            teamB: opp.t2.acronym || opp.t2.name,
+            teamAId: opp.t1.id,
+            teamBId: opp.t2.id,
+            pick, pickSide,
+            ourProb: +ourProb.toFixed(1),
+            marketProb: +marketProb.toFixed(1),
+            edge: +edge.toFixed(1),
+            betSize: confirmSize,
+            betPercent: +(confirmSize / state.bankroll * 100).toFixed(1),
+            confidence: pred.confidence,
+            betType: "confirmation",  // Tag it so we can track performance separately
+            event: `${opp.t1.acronym || opp.t1.name} vs ${opp.t2.acronym || opp.t2.name}`,
+            league: opp.match.league?.name || "",
+            format: opp.match.number_of_games || 1,
+            placedAt: now.toISOString(),
+            matchTime: opp.match.scheduled_at,
+            formA: pred.recordA,
+            formB: pred.recordB,
+            thesis: `CONFIRMATION BET: Model (${ourProb.toFixed(0)}%) and market (${marketProb.toFixed(0)}%) both agree — heavy favorite. ${pred.thesis || ""}`,
+            polyUrl: opp.polyOdds.polyUrl || null,
+            polyLiquidity: opp.polyOdds.liquidity,
+            matchStatus: "upcoming",
+          };
+
+          state.openPositions.push(position);
+          state.bankroll -= confirmSize;
+          confirmBets++;
+
+          push(`🎯 CONFIRM BET: ${pick} in ${position.event} | Model: ${ourProb.toFixed(1)}% | Market: ${marketProb.toFixed(1)}% | Size: $${confirmSize} (small grind)`);
+
+          const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
+          await sendTG(
+            `🎯 <b>CONFIRMATION BET</b>\n\n` +
+            `🎮 ${opp.match._game.toUpperCase()}\n` +
+            `📋 ${position.event}\n` +
+            `🏆 ${position.league} · BO${position.format}\n\n` +
+            `<b>Pick: ${pick} (heavy favorite)</b>\n` +
+            `Our model: <b>${ourProb.toFixed(1)}%</b>\n` +
+            `Market: <b>${marketProb.toFixed(1)}%</b>\n` +
+            `Both agree — taking the chalk.\n\n` +
+            `💵 Bet: <b>$${confirmSize}</b> (${position.betPercent}% — small grind)\n` +
+            `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>` +
+            polyLink
+          );
+        }
       }
     } else {
       if (state.openPositions.length >= MAX_POSITIONS) push("⏸️ Max positions reached");
