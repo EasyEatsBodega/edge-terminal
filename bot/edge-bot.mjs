@@ -44,14 +44,15 @@ const BETS_PER_RUN = 2;              // Quality over quantity — max 2 bets per
 const PRICE_DISCOVERY_MIN = 58;      // Market must show some signal (not coin-flip territory)
 
 // ─── Market Confirmation Mode ──────────────────────────────────────────────
-// When model AND market agree on a heavy favorite, take a small position.
+// When model AND market agree on a heavy favorite, take a bigger position.
 // Esports markets tend to underprice favorites (degen bettors love underdogs).
+// These are our "safe" plays — both signals agree, so size up.
 const CONFIRM_ENABLED = true;
 const CONFIRM_MIN_MARKET_PROB = 72;  // Market must see team as 72%+ favorite
 const CONFIRM_MIN_OUR_PROB = 70;     // Our model must also agree (70%+)
-const CONFIRM_MAX_BET_PCT = 2;       // Tiny bets — grinding small wins, not swinging
+const CONFIRM_MAX_BET_PCT = 5;       // 5% of bankroll — confident plays deserve real sizing
 const CONFIRM_MIN_LIQUIDITY = 3000;  // Higher liquidity required — need reliable prices
-const CONFIRM_MAX_PER_RUN = 1;       // Max 1 confirmation bet per run
+const CONFIRM_MAX_PER_RUN = 2;       // Up to 2 confirmation bets per run
 
 // ─── Drawdown Protection ───────────────────────────────────────────────────
 
