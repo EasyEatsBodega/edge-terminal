@@ -39,5 +39,15 @@ if [ "$OLD_HASH" != "$NEW_HASH" ]; then
   sleep 3
 fi
 
+# One-time state restore (auto-cleans up after running)
+RESTORE_SCRIPT="/root/edge-terminal/bot/restore-history.mjs"
+RESTORE_FLAG="/root/.edge-state-restored"
+if [ -f "$RESTORE_SCRIPT" ] && [ ! -f "$RESTORE_FLAG" ]; then
+  echo "$(date): Running one-time state restore..."
+  node "$RESTORE_SCRIPT"
+  touch "$RESTORE_FLAG"
+  echo "$(date): State restored. Flag set at $RESTORE_FLAG"
+fi
+
 # Run the bot (one-shot mode for cron)
 node /root/edge-terminal/bot/edge-bot.mjs --run
