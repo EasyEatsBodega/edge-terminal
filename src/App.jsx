@@ -20,6 +20,68 @@ const save = (k, v) => { try { localStorage.setItem(`et2_${k}`, JSON.stringify(v
 const load = (k, fb) => { try { const v = localStorage.getItem(`et2_${k}`); return v ? JSON.parse(v) : fb; } catch(e){ return fb; } };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// CHANGELOG — day-by-day bot updates for YouTube content
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const BOT_CHANGELOG = {
+  "2026-04-05": {
+    title: "Day 0 — Project Launch",
+    updates: [
+      { type: "launch", text: "Built Edge Terminal from scratch — esports prediction engine for CS2, Dota 2, and LoL" },
+      { type: "feature", text: "Paper trading bot with $1,000 starting bankroll" },
+      { type: "feature", text: "Polymarket API integration for real market odds" },
+      { type: "feature", text: "PandaScore API for match data, team histories, head-to-head records" },
+      { type: "feature", text: "Prediction model v1: weighted win rate (form 45%, overall 35%, H2H 15%)" },
+      { type: "infra", text: "Dashboard deployed on Vercel, bot deployed on VPS with cron" },
+    ],
+  },
+  "2026-04-06": {
+    title: "Day 1 — Bot Goes Live",
+    updates: [
+      { type: "feature", text: "Standalone VPS bot — no Redis dependency, file-based state" },
+      { type: "feature", text: "Telegram bot with /trades, /status, /run, /help commands" },
+      { type: "fix", text: "Fixed Polymarket outcomes parsing (was breaking on string JSON)" },
+      { type: "fix", text: "Fixed edge logic — was accidentally betting underdogs instead of predicted winners" },
+    ],
+  },
+  "2026-04-07": {
+    title: "Day 2 — First Bets + Major Overhaul",
+    updates: [
+      { type: "result", text: "First 3 bets placed: CRASH, ZOMB, InC — all 3 lost (0-3 record)" },
+      { type: "lesson", text: "Losses exposed problems: low-liquidity markets, no quality filters, betting garbage tier matches" },
+      { type: "feature", text: "Quality filter overhaul — $1k min liquidity, ranked picks by win probability" },
+      { type: "feature", text: "Direct Polymarket links on every bet" },
+      { type: "feature", text: "Smart cron with lock file + auto git sync (no more SSH needed)" },
+      { type: "feature", text: "/deploy command for instant VPS updates via Telegram" },
+      { type: "model", text: "Model v2 — opponent strength weighting by tournament tier (S/A/B)" },
+      { type: "model", text: "Exponential recency decay (0.8^i) instead of linear" },
+      { type: "model", text: "Hot/cold streak detection (last 3 matches)" },
+      { type: "model", text: "BO1 penalty — 50% bet size reduction + probability pull toward 50%" },
+      { type: "feature", text: "Loss analysis system — categorizes every loss (BO1 upset, thin edge, model overestimate, etc.)" },
+      { type: "feature", text: "Thesis generator — plain English reasoning for every pick" },
+      { type: "feature", text: "Dashboard overhaul — bankroll chart, P&L by game, bot vs market accuracy, LIVE badges" },
+      { type: "strategy", text: "Switched to aggressive mode — MIN_PROB 60%, bigger bets on 70%+ plays, 12hr scan window" },
+    ],
+  },
+  "2026-04-08": {
+    title: "Day 3 — Defense + Market Confirmation",
+    updates: [
+      { type: "result", text: "More losses — record at 1W-5L, bankroll down to ~$544" },
+      { type: "lesson", text: "Model was overconfident on low-tier matches. Market was right more often than us." },
+      { type: "model", text: "Model v3 — added game score analysis, dominance factor, clutch performance" },
+      { type: "strategy", text: "Defensive overhaul — drawdown protection, conservative sizing, circuit breaker on losing streaks" },
+      { type: "strategy", text: "Market confirmation strategy — only bet when model AND market agree on favorite" },
+      { type: "feature", text: "Tiered confirmation bets with game-specific tuning (CS2/Dota2/LoL)" },
+      { type: "feature", text: "Split performance tracking — regular bets vs confirmation bets" },
+      { type: "fix", text: "Fixed circuit breaker to stop Telegram spam + time-aware reset" },
+      { type: "feature", text: "Polymarket staleness filter — skip markets with old data" },
+      { type: "model", text: "Rustiness penalty for teams that haven't played recently" },
+      { type: "feature", text: "Daily Recap view — day-by-day breakdown with talking points for YouTube" },
+    ],
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DATA LAYER — PandaScore API with caching
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1269,6 +1331,11 @@ export default function App() {
                 if (!dayMap[d].placed.find(x => x.id === p.id)) dayMap[d].placed.push({ ...p, stillOpen: true });
               });
 
+              // Add changelog days even if no trades (e.g. Day 0 — launch day)
+              Object.keys(BOT_CHANGELOG).forEach(d => {
+                if (!dayMap[d]) dayMap[d] = { resolved: [], placed: [], date: d };
+              });
+
               const days = Object.values(dayMap).sort((a, b) => b.date.localeCompare(a.date));
 
               // Running bankroll calc (chronological)
@@ -1436,6 +1503,35 @@ export default function App() {
                                 <span>{tp.text}</span>
                               </div>
                             ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Bot Updates / Changelog */}
+                      {BOT_CHANGELOG[day.date] && (
+                        <div style={{ padding: "12px 18px", borderBottom: `1px solid ${PAL.border}`, background: `${PAL.bg}` }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, color: PAL.orange, letterSpacing: "0.1em", marginBottom: 4 }}>BOT UPDATES</div>
+                          <div style={{ fontSize: 14, fontWeight: 700, color: PAL.text, marginBottom: 8 }}>{BOT_CHANGELOG[day.date].title}</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                            {BOT_CHANGELOG[day.date].updates.map((u, i) => {
+                              const typeColors = {
+                                launch: { bg: `${PAL.purple}15`, color: PAL.purple, label: "LAUNCH" },
+                                feature: { bg: `${PAL.blue}15`, color: PAL.blue, label: "NEW" },
+                                fix: { bg: `${PAL.yellow}15`, color: PAL.yellow, label: "FIX" },
+                                model: { bg: `${PAL.green}15`, color: PAL.green, label: "MODEL" },
+                                strategy: { bg: `${PAL.orange}15`, color: PAL.orange, label: "STRAT" },
+                                result: { bg: `${PAL.red}15`, color: PAL.red, label: "RESULT" },
+                                lesson: { bg: `${PAL.purple}15`, color: PAL.purple, label: "LESSON" },
+                                infra: { bg: `${PAL.dim}20`, color: PAL.sub, label: "INFRA" },
+                              };
+                              const tc = typeColors[u.type] || typeColors.feature;
+                              return (
+                                <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12, lineHeight: 1.5 }}>
+                                  <span style={{ flexShrink: 0, fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 3, background: tc.bg, color: tc.color, marginTop: 1 }}>{tc.label}</span>
+                                  <span style={{ color: PAL.sub }}>{u.text}</span>
+                                </div>
+                              );
+                            })}
                           </div>
                         </div>
                       )}
