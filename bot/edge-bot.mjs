@@ -31,16 +31,17 @@ const CFG = loadConfig();
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INITIAL_BANKROLL = 1000;
-const MAX_DEPLOYED_PCT = 20;         // Conservative — protect remaining bankroll
-const MAX_POSITIONS = 5;             // Fewer concurrent bets = less correlated risk
+const MAX_DEPLOYED_PCT = 30;         // Allow more deployment for volume
+const MAX_POSITIONS = 8;             // More concurrent positions for action
 const MIN_EDGE = 5;                  // Need real edge vs market, not 3% noise
 const MAX_BET_PCT = 5;               // Smaller max bet — survival first
 const MIN_BET = 5;
-const BET_WINDOW_MIN_H = 0.5;       // 30min minimum — need settled odds
-const BET_WINDOW_MAX_H = 6;          // Tighter window — odds more reliable closer to match
+const BET_WINDOW_MIN_H = 0.5;        // 30min minimum — need settled odds
+const BET_WINDOW_MAX_H = 6;          // 6h max window
+const PRIORITY_WINDOW_H = 3;         // Matches within 3h get priority ranking
 const MIN_LIQUIDITY = 2000;          // Real liquidity only — thin markets = bad prices
 const MIN_OUR_PROB = 60;             // Keep — only bet confident picks
-const BETS_PER_RUN = 2;              // Quality over quantity — max 2 bets per run
+const BETS_PER_RUN = 3;              // Up to 3 edge bets per run
 const PRICE_DISCOVERY_MIN = 58;      // Market must show some signal (not coin-flip territory)
 
 // ─── Market Confirmation Mode ──────────────────────────────────────────────
@@ -52,7 +53,7 @@ const CONFIRM_ENABLED = true;
 const CONFIRM_MIN_MARKET_PROB = 72;  // Market must see team as 72%+ favorite
 const CONFIRM_MIN_OUR_PROB = 70;     // Our model must also agree (70%+)
 const CONFIRM_MIN_LIQUIDITY = 3000;  // Higher liquidity required — need reliable prices
-const CONFIRM_MAX_PER_RUN = 2;       // Up to 2 confirmation bets per run
+const CONFIRM_MAX_PER_RUN = 3;       // Up to 3 confirmation bets per run
 
 // Tiered sizing — stronger consensus = bigger position
 const CONFIRM_TIERS = [
@@ -606,6 +607,33 @@ function shouldCircuitBreak(state) {
   return false;
 }
 
+// League-level blacklist — which leagues are we losing in repeatedly?
+// Returns a Set of league names to skip entirely.
+function getBlacklistedLeagues(state) {
+  const closed = state.closedPositions || [];
+  const fourteenDaysAgo = new Date(Date.now() - 14 * 86400000).toISOString();
+  const recent = closed.filter(p => (p.resolvedAt || p.placedAt) > fourteenDaysAgo);
+
+  const byLeague = {};
+  recent.forEach(p => {
+    const lg = p.league || "";
+    if (!lg) return;
+    if (!byLeague[lg]) byLeague[lg] = { w: 0, l: 0 };
+    if (p.result === "win") byLeague[lg].w++;
+    else byLeague[lg].l++;
+  });
+
+  const blacklist = new Set();
+  Object.entries(byLeague).forEach(([lg, d]) => {
+    const total = d.w + d.l;
+    // Blacklist if 3+ trades AND win rate below 25%
+    if (total >= 3 && d.w / total < 0.25) {
+      blacklist.add(lg);
+    }
+  });
+  return blacklist;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN BOT RUN
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -784,6 +812,12 @@ async function runBot() {
 
       push(`📊 Found ${allMatches.length} upcoming matches, ${polyMarkets.length} Polymarket moneyline markets`);
 
+      // Compute league blacklist — leagues where we've been losing recently
+      const blacklistedLeagues = getBlacklistedLeagues(state);
+      if (blacklistedLeagues.size > 0) {
+        push(`🚫 Blacklisted leagues: ${[...blacklistedLeagues].join(", ")}`);
+      }
+
       const opportunities = [];
       let skippedLowLiq = 0;
 
@@ -820,10 +854,20 @@ async function runBot() {
           continue;
         }
 
+        // FILTER: Skip blacklisted leagues — places we've been losing
+        const leagueName = m.league?.name || "";
+        if (leagueName && blacklistedLeagues.has(leagueName)) {
+          skippedLowLiq++;
+          continue;
+        }
+
         opportunities.push({ match: m, t1, t2, polyOdds });
       }
 
-      push(`🎯 ${opportunities.length} quality matches (skipped ${skippedLowLiq} low-liquidity/no-edge markets)`);
+      // Sort opportunities by time (soonest first) so we prioritize imminent action
+      opportunities.sort((a, b) => new Date(a.match.scheduled_at) - new Date(b.match.scheduled_at));
+
+      push(`🎯 ${opportunities.length} quality matches (skipped ${skippedLowLiq} low-liquidity/no-edge/blacklisted markets)`);
 
       // Analyze ALL matched opportunities — needed for both edge + confirmation bets
       const analyzed = [];
@@ -853,21 +897,36 @@ async function runBot() {
           if (edge < gameMinEdge) continue;
           if (pred.confidence === "low" && ourProb < 65) continue;
 
+          // UNDERDOG GUARD — never bet a team the market considers an underdog
+          // unless our model has STRONG conviction (65%+).
+          // 50% model conviction on a 30% market dog is NOT an edge, it's a coin flip.
+          if (marketProb < 45 && ourProb < 65) continue;
+          // Market-disagrees-hard guard — if market thinks <40%, require near-certainty
+          if (marketProb < 40 && ourProb < 70) continue;
+
           analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
         } catch (e) {
           push(`⚠️ Error analyzing ${opp.t1.name} vs ${opp.t2.name}: ${e.message}`);
         }
       }
 
-      // RANK by edge (highest first) — biggest market mispricing = best opportunity
-      analyzed.sort((a, b) => b.edge - a.edge);
+      // RANK by composite score: edge + time-proximity bonus
+      // Matches within the priority window (3h) get a boost so we prefer imminent action
+      const scoreOpp = (x) => {
+        const hoursUntil = (new Date(x.opp.match.scheduled_at) - now) / 3600000;
+        // Time bonus: 2 points if within 1h, 1 point if 1-3h, 0 if 3h+
+        const timeBonus = hoursUntil <= 1 ? 2 : hoursUntil <= PRIORITY_WINDOW_H ? 1 : 0;
+        return x.edge + timeBonus;
+      };
+      analyzed.sort((a, b) => scoreOpp(b) - scoreOpp(a));
 
       if (analyzed.length > 0) {
-        push(`🏆 ${analyzed.length} opportunities pass filters — ranked by edge:`);
+        push(`🏆 ${analyzed.length} opportunities pass filters — ranked by edge+time:`);
         for (let i = 0; i < Math.min(analyzed.length, 5); i++) {
           const a = analyzed[i];
           const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-          push(`   ${i + 1}. ${pick} (${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}) — Edge: +${a.edge.toFixed(1)}% | Model: ${a.ourProb.toFixed(1)}% | Market: ${a.marketProb.toFixed(1)}% | Liq: $${a.opp.polyOdds.liquidity.toFixed(0)}`);
+          const hoursUntil = ((new Date(a.opp.match.scheduled_at) - now) / 3600000).toFixed(1);
+          push(`   ${i + 1}. ${pick} (${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}) — Edge: +${a.edge.toFixed(1)}% | Model: ${a.ourProb.toFixed(1)}% | Market: ${a.marketProb.toFixed(1)}% | In ${hoursUntil}h | Liq: $${a.opp.polyOdds.liquidity.toFixed(0)}`);
         }
       } else {
         push("📭 No opportunities pass quality filters this run");
@@ -949,8 +1008,15 @@ async function runBot() {
       if (CONFIRM_ENABLED && state.openPositions.length < MAX_POSITIONS) {
         let confirmBets = 0;
 
+        // Sort confirmation candidates by time (soonest first) so we prioritize
+        // imminent action. allPredictions was already ordered by time from
+        // opportunities.sort() above, but do it explicitly here to be safe.
+        const confirmCandidates = [...allPredictions].sort(
+          (a, b) => new Date(a.opp.match.scheduled_at) - new Date(b.opp.match.scheduled_at)
+        );
+
         // Use allPredictions (already computed above) — no extra API calls needed
-        for (const ap of allPredictions) {
+        for (const ap of confirmCandidates) {
           if (confirmBets >= CONFIRM_MAX_PER_RUN) break;
           if (state.openPositions.length >= MAX_POSITIONS) break;
           if (state.openPositions.some(p => p.matchId === ap.opp.match.id)) continue;
@@ -1418,11 +1484,162 @@ async function handleTelegramCommand(text) {
     return msg;
   }
 
+  if (cmd === "/analyze" || cmd === "/losses") {
+    const closed = state.closedPositions || [];
+    const losses = closed.filter(p => p.result === "loss");
+    const wins = closed.filter(p => p.result === "win");
+
+    if (losses.length === 0) return "No losses yet — either a fresh start or we're 100%!";
+
+    // Group losses by dimensions
+    const byGame = {};
+    const byLeague = {};
+    const byFormat = {};
+    const byConfidence = {};
+    const byType = { edge: { w: 0, l: 0, pnl: 0 }, confirmation: { w: 0, l: 0, pnl: 0 } };
+    const byMarketRange = {
+      "50-55": { w: 0, l: 0 },   // coin flip territory
+      "55-65": { w: 0, l: 0 },   // slight favorite
+      "65-75": { w: 0, l: 0 },   // clear favorite
+      "75-85": { w: 0, l: 0 },   // heavy favorite
+      "85+":   { w: 0, l: 0 },   // lock
+    };
+    const byEdgeRange = {
+      "<3":  { w: 0, l: 0 },
+      "3-5": { w: 0, l: 0 },
+      "5-8": { w: 0, l: 0 },
+      "8+":  { w: 0, l: 0 },
+    };
+
+    const bucket = (p) => {
+      const g = p.game || "unknown";
+      const lg = p.league || "(unknown)";
+      const fmt = `BO${p.format || "?"}`;
+      const conf = p.confidence || "?";
+      const typ = p.betType === "confirmation" ? "confirmation" : "edge";
+      const isWin = p.result === "win";
+      const inc = (obj, key) => {
+        if (!obj[key]) obj[key] = { w: 0, l: 0, pnl: 0 };
+        if (isWin) obj[key].w++;
+        else obj[key].l++;
+        obj[key].pnl += p.pnl || 0;
+      };
+      inc(byGame, g);
+      inc(byLeague, lg);
+      inc(byFormat, fmt);
+      inc(byConfidence, conf);
+      byType[typ] = byType[typ] || { w: 0, l: 0, pnl: 0 };
+      if (isWin) byType[typ].w++;
+      else byType[typ].l++;
+      byType[typ].pnl += p.pnl || 0;
+
+      // Market prob bucket
+      const m = p.marketProb || 50;
+      let mb;
+      if (m < 55) mb = "50-55";
+      else if (m < 65) mb = "55-65";
+      else if (m < 75) mb = "65-75";
+      else if (m < 85) mb = "75-85";
+      else mb = "85+";
+      if (isWin) byMarketRange[mb].w++;
+      else byMarketRange[mb].l++;
+
+      // Edge bucket
+      const e = p.edge || 0;
+      let eb;
+      if (e < 3) eb = "<3";
+      else if (e < 5) eb = "3-5";
+      else if (e < 8) eb = "5-8";
+      else eb = "8+";
+      if (isWin) byEdgeRange[eb].w++;
+      else byEdgeRange[eb].l++;
+    };
+    closed.forEach(bucket);
+
+    const fmtRow = (name, d) => {
+      const total = d.w + d.l;
+      const pct = total > 0 ? (d.w / total * 100).toFixed(0) : 0;
+      const pnl = d.pnl !== undefined ? ` | ${d.pnl >= 0 ? "+" : ""}$${d.pnl.toFixed(0)}` : "";
+      return `   ${name}: ${d.w}W-${d.l}L (${pct}%)${pnl}`;
+    };
+
+    const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+    let msg = `🔍 <b>LOSS ANALYSIS</b>\n`;
+    msg += `${wins.length}W - ${losses.length}L over ${closed.length} trades\n\n`;
+
+    msg += `<b>BY GAME</b>\n`;
+    Object.entries(byGame).sort((a, b) => b[1].l - a[1].l).forEach(([k, d]) => {
+      msg += fmtRow(GLABEL[k] || k, d) + "\n";
+    });
+
+    msg += `\n<b>BY LEAGUE (worst first)</b>\n`;
+    Object.entries(byLeague)
+      .filter(([, d]) => d.w + d.l >= 1)
+      .sort((a, b) => (b[1].l - b[1].w) - (a[1].l - a[1].w))
+      .slice(0, 5)
+      .forEach(([k, d]) => {
+        msg += fmtRow(k.slice(0, 30), d) + "\n";
+      });
+
+    msg += `\n<b>BY FORMAT</b>\n`;
+    Object.entries(byFormat).forEach(([k, d]) => {
+      msg += fmtRow(k, d) + "\n";
+    });
+
+    msg += `\n<b>BY CONFIDENCE</b>\n`;
+    Object.entries(byConfidence).forEach(([k, d]) => {
+      msg += fmtRow(k, d) + "\n";
+    });
+
+    msg += `\n<b>BY MARKET PROB (higher = safer)</b>\n`;
+    Object.entries(byMarketRange).forEach(([k, d]) => {
+      if (d.w + d.l > 0) msg += fmtRow(`${k}%`, d) + "\n";
+    });
+
+    msg += `\n<b>BY EDGE SIZE</b>\n`;
+    Object.entries(byEdgeRange).forEach(([k, d]) => {
+      if (d.w + d.l > 0) msg += fmtRow(`${k}%`, d) + "\n";
+    });
+
+    // Smart insights
+    const insights = [];
+    const worstLeague = Object.entries(byLeague)
+      .filter(([, d]) => d.w + d.l >= 2 && d.l > d.w)
+      .sort((a, b) => (b[1].l - b[1].w) - (a[1].l - a[1].w))[0];
+    if (worstLeague) {
+      insights.push(`⚠️ Losing streak in <b>${worstLeague[0]}</b> — consider skipping this league`);
+    }
+
+    const coinFlipLosses = byMarketRange["50-55"].l;
+    if (coinFlipLosses >= 2) {
+      insights.push(`⚠️ ${coinFlipLosses} losses on 50-55% coin-flip markets — these are traps`);
+    }
+
+    const smallEdgeLosses = (byEdgeRange["<3"].l) + (byEdgeRange["3-5"].l);
+    const smallEdgeTotal = (byEdgeRange["<3"].l + byEdgeRange["<3"].w) + (byEdgeRange["3-5"].l + byEdgeRange["3-5"].w);
+    if (smallEdgeTotal > 0 && smallEdgeLosses / smallEdgeTotal > 0.5) {
+      insights.push(`⚠️ Small edges (<5%) are mostly losing — need bigger edge threshold`);
+    }
+
+    const lowConfLosses = byConfidence["low"]?.l || 0;
+    if (lowConfLosses >= 2) {
+      insights.push(`⚠️ Low-confidence bets losing — model needs more data before betting`);
+    }
+
+    if (insights.length > 0) {
+      msg += `\n<b>🧠 INSIGHTS</b>\n`;
+      insights.forEach(i => { msg += `${i}\n`; });
+    }
+
+    return msg;
+  }
+
   if (cmd === "/help") {
     return `🤖 <b>Edge Terminal Bot</b>\n\n` +
       `/trades — Open positions with live prices + thesis\n` +
       `/status — Bankroll, P&L, win rate\n` +
       `/summary — Full analytics + bot vs market\n` +
+      `/analyze — Deep-dive loss analysis + insights\n` +
       `/run — Trigger a bot run now\n` +
       `/deploy — Pull latest code + restart\n` +
       `/cancel — Cancel all open positions\n` +
