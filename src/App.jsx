@@ -258,7 +258,7 @@ const calcKelly = (prob, impliedProb) => {
 export default function App() {
   const [pandaKey, setPandaKey] = useState(() => load("pandaKey", ""));
   const [keyInput, setKeyInput] = useState(() => load("pandaKey", ""));
-  const [view, setView] = useState("bot"); // bot | predictions | log | settings
+  const [view, setView] = useState("bot"); // bot | predictions | log | daily | settings
   const [gameFilter, setGameFilter] = useState("all"); // all | csgo | dota2 | lol
   const [sortBy, setSortBy] = useState("time"); // time | edge
   const [expandedMatch, setExpandedMatch] = useState(null);
@@ -552,6 +552,7 @@ export default function App() {
             { id: "predictions", label: "Predictions" },
             { id: "log", label: `Bet Log${betLog.length ? ` (${betLog.length})` : ""}` },
             { id: "bot", label: `Bot${botState ? ` $${botState.bankroll?.toFixed(0)}` : ""}` },
+            { id: "daily", label: "Daily Recap" },
           ].map(v => (
             <button key={v.id} onClick={() => setView(v.id)} style={{
               width: "100%", padding: "7px 8px", borderRadius: 6, border: "none",
@@ -1227,6 +1228,303 @@ export default function App() {
               )}
             </>);
             })()}
+          </>)}
+
+          {/* ─── DAILY RECAP VIEW ─── */}
+          {view === "daily" && (<>
+            <div style={{ marginBottom: 16 }}>
+              <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: "-0.03em", margin: 0 }}>Daily Recap</h1>
+              <p style={{ fontSize: 13, color: PAL.sub, marginTop: 4 }}>Day-by-day breakdown for content</p>
+            </div>
+
+            {botState && (() => {
+              const closed = botState.closedPositions || [];
+              const open = botState.openPositions || [];
+              const initial = botState.initialBankroll || 1000;
+
+              // Group all activity by day
+              const dayMap = {};
+
+              // Add closed trades by resolution date
+              closed.forEach(p => {
+                const d = (p.resolvedAt || p.placedAt || "").slice(0, 10);
+                if (!d) return;
+                if (!dayMap[d]) dayMap[d] = { resolved: [], placed: [], date: d };
+                dayMap[d].resolved.push(p);
+              });
+
+              // Add placed date for closed trades too (might differ from resolved date)
+              closed.forEach(p => {
+                const d = (p.placedAt || "").slice(0, 10);
+                if (!d) return;
+                if (!dayMap[d]) dayMap[d] = { resolved: [], placed: [], date: d };
+                if (!dayMap[d].placed.find(x => x.id === p.id)) dayMap[d].placed.push(p);
+              });
+
+              // Add open positions by placed date
+              open.forEach(p => {
+                const d = (p.placedAt || "").slice(0, 10);
+                if (!d) return;
+                if (!dayMap[d]) dayMap[d] = { resolved: [], placed: [], date: d };
+                if (!dayMap[d].placed.find(x => x.id === p.id)) dayMap[d].placed.push({ ...p, stillOpen: true });
+              });
+
+              const days = Object.values(dayMap).sort((a, b) => b.date.localeCompare(a.date));
+
+              // Running bankroll calc (chronological)
+              const chronDays = [...days].reverse();
+              let runningBankroll = initial;
+              const bankrollByDay = {};
+              chronDays.forEach(day => {
+                const dayPnl = day.resolved.reduce((s, p) => s + (p.pnl || 0), 0);
+                const dayDeployed = day.placed.filter(p => !day.resolved.find(r => r.id === p.id)).reduce((s, p) => s + (p.betSize || 0), 0);
+                runningBankroll += dayPnl;
+                bankrollByDay[day.date] = { bankroll: runningBankroll, pnl: dayPnl, deployed: dayDeployed };
+              });
+
+              if (days.length === 0) return (
+                <div style={{ padding: 40, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
+                  No trading activity yet. Daily recaps will appear once the bot starts placing bets.
+                </div>
+              );
+
+              // Overall cumulative stats for header
+              const totalDays = days.length;
+              const winDays = days.filter(d => d.resolved.reduce((s, p) => s + (p.pnl || 0), 0) > 0).length;
+              const lossDays = days.filter(d => d.resolved.length > 0 && d.resolved.reduce((s, p) => s + (p.pnl || 0), 0) <= 0).length;
+
+              return (<>
+                {/* Cumulative header */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 18 }}>
+                  <NumCard label="Days Active" value={totalDays} color={PAL.purple} />
+                  <NumCard label="Green Days" value={winDays} color={PAL.green} sub={`${lossDays} red days`} />
+                  <NumCard label="Total Trades" value={closed.length + open.length} color={PAL.text} sub={`${open.length} still open`} />
+                  <NumCard label="Current Bankroll" value={`$${botState.bankroll?.toFixed(0)}`} color={botState.bankroll >= initial ? PAL.green : PAL.red} sub={`Started $${initial}`} />
+                </div>
+
+                {/* Day-by-day cards */}
+                {days.map((day, dayIdx) => {
+                  const dayDate = new Date(day.date + "T12:00:00Z");
+                  const dateLabel = dayDate.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+                  const isToday = day.date === new Date().toISOString().slice(0, 10);
+                  const isYesterday = day.date === new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+                  const dayLabel = isToday ? "Today" : isYesterday ? "Yesterday" : dateLabel;
+
+                  const dayResolved = day.resolved;
+                  const dayPlaced = day.placed;
+                  const dayWins = dayResolved.filter(p => p.result === "win");
+                  const dayLosses = dayResolved.filter(p => p.result === "loss");
+                  const dayPnl = dayResolved.reduce((s, p) => s + (p.pnl || 0), 0);
+                  const dayBetTotal = dayPlaced.reduce((s, p) => s + (p.betSize || 0), 0);
+                  const dayAvgEdge = dayPlaced.length > 0 ? dayPlaced.reduce((s, p) => s + (p.edge || 0), 0) / dayPlaced.length : 0;
+                  const dayBk = bankrollByDay[day.date] || {};
+
+                  // Games active this day
+                  const gamesActive = [...new Set([...dayPlaced, ...dayResolved].map(p => p.game))];
+
+                  // Best and worst trade of the day
+                  const bestTrade = dayResolved.length > 0 ? dayResolved.reduce((b, p) => (p.pnl || 0) > (b.pnl || 0) ? p : b, dayResolved[0]) : null;
+                  const worstTrade = dayResolved.length > 0 ? dayResolved.reduce((w, p) => (p.pnl || 0) < (w.pnl || 0) ? p : w, dayResolved[0]) : null;
+
+                  // Talking points
+                  const talkingPoints = [];
+
+                  // Overall day narrative
+                  if (dayResolved.length > 0) {
+                    if (dayWins.length > 0 && dayLosses.length === 0) {
+                      talkingPoints.push({ icon: "fire", text: `Perfect day — went ${dayWins.length} for ${dayResolved.length}, no losses` });
+                    } else if (dayLosses.length > 0 && dayWins.length === 0) {
+                      talkingPoints.push({ icon: "skull", text: `Rough day — ${dayLosses.length} loss${dayLosses.length > 1 ? "es" : ""}, nothing hit` });
+                    } else if (dayWins.length > dayLosses.length) {
+                      talkingPoints.push({ icon: "chart", text: `Positive day — ${dayWins.length}W ${dayLosses.length}L, net ${dayPnl >= 0 ? "+" : ""}$${dayPnl.toFixed(2)}` });
+                    } else {
+                      talkingPoints.push({ icon: "chart", text: `Mixed results — ${dayWins.length}W ${dayLosses.length}L, net ${dayPnl >= 0 ? "+" : ""}$${dayPnl.toFixed(2)}` });
+                    }
+                  }
+
+                  if (dayPlaced.length > 0 && dayResolved.length === 0) {
+                    talkingPoints.push({ icon: "clock", text: `Placed ${dayPlaced.length} new bet${dayPlaced.length > 1 ? "s" : ""} — waiting for results` });
+                  }
+
+                  // High conviction plays
+                  const highConv = dayPlaced.filter(p => (p.ourProb || 0) >= 70);
+                  if (highConv.length > 0) {
+                    talkingPoints.push({ icon: "target", text: `${highConv.length} high-conviction play${highConv.length > 1 ? "s" : ""} (70%+ model confidence): ${highConv.map(p => p.pick).join(", ")}` });
+                  }
+
+                  // BO1 risk
+                  const bo1Plays = dayPlaced.filter(p => p.format === 1);
+                  if (bo1Plays.length > 0) {
+                    talkingPoints.push({ icon: "warning", text: `${bo1Plays.length} BO1 play${bo1Plays.length > 1 ? "s" : ""} — higher variance, reduced bet sizing` });
+                  }
+
+                  // Best trade callout
+                  if (bestTrade && (bestTrade.pnl || 0) > 0) {
+                    talkingPoints.push({ icon: "trophy", text: `Best trade: ${bestTrade.pick} in ${bestTrade.event} → +$${(bestTrade.pnl || 0).toFixed(2)}` });
+                  }
+
+                  // Loss analysis
+                  const lossReasons = dayLosses.filter(p => p.lossReason).map(p => p.lossReason);
+                  if (lossReasons.length > 0) {
+                    const uniqueReasons = [...new Set(lossReasons)];
+                    talkingPoints.push({ icon: "analyze", text: `Loss breakdown: ${uniqueReasons.join("; ")}` });
+                  }
+
+                  // Model vs market
+                  if (dayResolved.length >= 2) {
+                    let botRight = 0, mktRight = 0;
+                    dayResolved.forEach(p => {
+                      if ((p.ourProb > 50) === (p.result === "win")) botRight++;
+                      if ((p.marketProb > 50) === (p.result === "win")) mktRight++;
+                    });
+                    if (botRight !== mktRight) {
+                      talkingPoints.push({ icon: "vs", text: `Model ${botRight > mktRight ? "beat" : "lost to"} market today — Bot ${botRight}/${dayResolved.length} vs Market ${mktRight}/${dayResolved.length}` });
+                    }
+                  }
+
+                  // Edge sizing
+                  if (dayAvgEdge > 5) {
+                    talkingPoints.push({ icon: "edge", text: `High average edge today: ${dayAvgEdge.toFixed(1)}% — found strong value` });
+                  }
+
+                  const tpIcons = { fire: "\u{1F525}", skull: "\u{1F480}", chart: "\u{1F4C8}", clock: "\u23F3", target: "\u{1F3AF}", warning: "\u26A0\uFE0F", trophy: "\u{1F3C6}", analyze: "\u{1F50D}", vs: "\u2694\uFE0F", edge: "\u{1F4A1}" };
+
+                  return (
+                    <div key={day.date} style={{ marginBottom: 16, background: PAL.panel, borderRadius: 12, border: `1px solid ${isToday ? PAL.purple + "50" : PAL.border}`, overflow: "hidden" }}>
+                      {/* Day Header */}
+                      <div style={{
+                        padding: "14px 18px", display: "flex", justifyContent: "space-between", alignItems: "center",
+                        background: isToday ? `${PAL.purple}08` : "transparent",
+                        borderBottom: `1px solid ${PAL.border}`,
+                      }}>
+                        <div>
+                          <div style={{ fontSize: 16, fontWeight: 800, display: "flex", alignItems: "center", gap: 8 }}>
+                            {dayLabel}
+                            {isToday && <span style={{ fontSize: 10, fontWeight: 600, color: PAL.purple, background: `${PAL.purple}20`, padding: "2px 8px", borderRadius: 4 }}>LIVE</span>}
+                          </div>
+                          <div style={{ fontSize: 12, color: PAL.dim, marginTop: 2 }}>
+                            {!isToday && !isYesterday && dateLabel}
+                            {gamesActive.length > 0 && <> · {gamesActive.map(g => GAME_LABEL[g] || g).join(", ")}</>}
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+                          {dayResolved.length > 0 && (
+                            <div style={{ textAlign: "right" }}>
+                              <div style={{ fontSize: 20, fontWeight: 800, color: dayPnl >= 0 ? PAL.green : PAL.red }}>
+                                {dayPnl >= 0 ? "+" : ""}${dayPnl.toFixed(2)}
+                              </div>
+                              <div style={{ fontSize: 11, color: PAL.dim }}>{dayWins.length}W - {dayLosses.length}L</div>
+                            </div>
+                          )}
+                          {dayResolved.length === 0 && dayPlaced.length > 0 && (
+                            <div style={{ textAlign: "right" }}>
+                              <div style={{ fontSize: 14, fontWeight: 600, color: PAL.yellow }}>Pending</div>
+                              <div style={{ fontSize: 11, color: PAL.dim }}>{dayPlaced.length} bet{dayPlaced.length > 1 ? "s" : ""} placed</div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Talking Points */}
+                      {talkingPoints.length > 0 && (
+                        <div style={{ padding: "12px 18px", borderBottom: `1px solid ${PAL.border}`, background: `${PAL.card}` }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, color: PAL.purple, letterSpacing: "0.1em", marginBottom: 8 }}>TALKING POINTS</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                            {talkingPoints.map((tp, i) => (
+                              <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, color: PAL.sub, lineHeight: 1.5 }}>
+                                <span style={{ flexShrink: 0, fontSize: 14 }}>{tpIcons[tp.icon] || "\u2022"}</span>
+                                <span>{tp.text}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Day's Trades */}
+                      <div style={{ padding: "12px 18px" }}>
+                        {dayPlaced.length > 0 && (
+                          <div style={{ marginBottom: dayResolved.length > 0 && dayPlaced.some(p => !dayResolved.find(r => r.id === p.id)) ? 12 : 0 }}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: PAL.dim, letterSpacing: "0.1em", marginBottom: 6 }}>
+                              {dayPlaced.some(p => p.stillOpen) ? "OPEN POSITIONS" : "TRADES"}
+                            </div>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                              {dayPlaced.map(p => {
+                                const resolved = dayResolved.find(r => r.id === p.id);
+                                const isOpen = p.stillOpen || (!resolved && !closed.find(c => c.id === p.id));
+                                return (
+                                  <div key={p.id} style={{
+                                    display: "grid", gridTemplateColumns: "44px 1fr 60px 60px 50px 55px 70px",
+                                    padding: "8px 12px", borderRadius: 6,
+                                    background: PAL.bg,
+                                    borderLeft: `3px solid ${resolved ? (resolved.result === "win" ? PAL.green : PAL.red) : isOpen ? PAL.yellow : PAL.dim}`,
+                                    alignItems: "center", gap: 6, fontSize: 12,
+                                  }}>
+                                    <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
+                                    <div>
+                                      <div style={{ fontWeight: 600, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}>
+                                        {p.pick}
+                                        {resolved && <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: resolved.result === "win" ? `${PAL.green}20` : `${PAL.red}20`, color: resolved.result === "win" ? PAL.green : PAL.red }}>{resolved.result?.toUpperCase()}</span>}
+                                        {isOpen && <span style={{ fontSize: 9, fontWeight: 600, padding: "1px 5px", borderRadius: 3, background: `${PAL.yellow}20`, color: PAL.yellow }}>OPEN</span>}
+                                      </div>
+                                      <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{p.format > 1 ? ` · BO${p.format}` : " · BO1"}</div>
+                                    </div>
+                                    <div style={{ textAlign: "center" }}>
+                                      <div style={{ fontWeight: 600 }}>{p.ourProb}%</div>
+                                      <div style={{ fontSize: 9, color: PAL.dim }}>model</div>
+                                    </div>
+                                    <div style={{ textAlign: "center" }}>
+                                      <div style={{ color: PAL.sub }}>{p.marketProb}%</div>
+                                      <div style={{ fontSize: 9, color: PAL.dim }}>market</div>
+                                    </div>
+                                    <div style={{ textAlign: "center", fontWeight: 600, color: PAL.green, fontSize: 12 }}>+{p.edge}%</div>
+                                    <div style={{ textAlign: "center", fontWeight: 600, fontSize: 12 }}>${p.betSize}</div>
+                                    <div style={{ textAlign: "right", fontWeight: 700, fontSize: 12, color: resolved ? ((resolved.pnl || 0) >= 0 ? PAL.green : PAL.red) : PAL.dim }}>
+                                      {resolved ? `${(resolved.pnl || 0) >= 0 ? "+" : ""}$${(resolved.pnl || 0).toFixed(2)}` : "—"}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Thesis breakdown per trade */}
+                        {dayPlaced.filter(p => p.thesis).length > 0 && (
+                          <div style={{ marginTop: 10 }}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: PAL.dim, letterSpacing: "0.1em", marginBottom: 6 }}>MODEL REASONING</div>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                              {dayPlaced.filter(p => p.thesis).map(p => (
+                                <div key={p.id + "_thesis"} style={{
+                                  padding: "8px 12px", background: PAL.bg, borderRadius: 6,
+                                  borderLeft: `3px solid ${PAL.purple}`,
+                                }}>
+                                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 3, color: PAL.text }}>{p.pick} — {p.event}</div>
+                                  <div style={{ fontSize: 11, color: PAL.dim, lineHeight: 1.5, fontStyle: "italic" }}>{p.thesis}</div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Day bankroll state */}
+                        {dayBk.bankroll && (
+                          <div style={{ marginTop: 10, padding: "8px 12px", background: PAL.bg, borderRadius: 6, display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                            <span style={{ color: PAL.dim }}>End of day bankroll</span>
+                            <span style={{ fontWeight: 700, color: dayBk.bankroll >= initial ? PAL.green : PAL.red }}>${dayBk.bankroll.toFixed(2)}</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </>);
+            })()}
+
+            {!botState && (
+              <div style={{ padding: 40, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
+                Connect to the bot to see daily recaps. Go to the Bot view first.
+              </div>
+            )}
           </>)}
 
           {/* ─── BET LOG VIEW ─── */}
