@@ -819,7 +819,15 @@ async function runBot() {
       }
 
       const opportunities = [];
-      let skippedLowLiq = 0;
+      const rejections = {
+        outOfWindow: 0,
+        alreadyBetting: 0,
+        noPolyOdds: 0,
+        lowLiquidity: 0,
+        staleMarket: 0,
+        coinFlip: 0,
+        blacklisted: 0,
+      };
 
       for (const m of allMatches) {
         const t1 = m.opponents?.[0]?.opponent;
@@ -828,36 +836,45 @@ async function runBot() {
 
         const matchTime = new Date(m.scheduled_at);
         const hoursUntil = (matchTime - now) / 3600000;
-        if (hoursUntil < BET_WINDOW_MIN_H || hoursUntil > BET_WINDOW_MAX_H) continue;
-        if (state.openPositions.some(p => p.matchId === m.id)) continue;
+        if (hoursUntil < BET_WINDOW_MIN_H || hoursUntil > BET_WINDOW_MAX_H) {
+          rejections.outOfWindow++;
+          continue;
+        }
+        if (state.openPositions.some(p => p.matchId === m.id)) {
+          rejections.alreadyBetting++;
+          continue;
+        }
 
         const polyOdds = matchPolymarket(polyMarkets, t1.name, t2.name) ||
                          matchPolymarket(polyMarkets, t1.acronym || t1.name, t2.acronym || t2.name);
-        if (!polyOdds) continue;
+        if (!polyOdds) {
+          rejections.noPolyOdds++;
+          continue;
+        }
 
         // FILTER: Skip low-liquidity markets — prices are meaningless without real money behind them
         if (polyOdds.liquidity < MIN_LIQUIDITY) {
-          skippedLowLiq++;
+          rejections.lowLiquidity++;
           continue;
         }
 
         // FILTER: Skip stale markets — if not updated in 2+ hours, prices may be unreliable
         if (polyOdds.hoursSinceUpdate !== null && polyOdds.hoursSinceUpdate > 2) {
-          skippedLowLiq++;
+          rejections.staleMarket++;
           continue;
         }
 
         // FILTER: Skip coin-flip markets — need real price discovery signal
         const maxProb = Math.max(polyOdds.probA, polyOdds.probB);
         if (maxProb < PRICE_DISCOVERY_MIN) {
-          skippedLowLiq++;
+          rejections.coinFlip++;
           continue;
         }
 
         // FILTER: Skip blacklisted leagues — places we've been losing
         const leagueName = m.league?.name || "";
         if (leagueName && blacklistedLeagues.has(leagueName)) {
-          skippedLowLiq++;
+          rejections.blacklisted++;
           continue;
         }
 
@@ -867,11 +884,20 @@ async function runBot() {
       // Sort opportunities by time (soonest first) so we prioritize imminent action
       opportunities.sort((a, b) => new Date(a.match.scheduled_at) - new Date(b.match.scheduled_at));
 
-      push(`🎯 ${opportunities.length} quality matches (skipped ${skippedLowLiq} low-liquidity/no-edge/blacklisted markets)`);
+      // Detailed breakdown of why matches were rejected
+      push(`🎯 ${opportunities.length} quality matches`);
+      push(`   Rejections: ${rejections.outOfWindow} out-of-window · ${rejections.noPolyOdds} no-polymarket · ${rejections.lowLiquidity} low-liq · ${rejections.staleMarket} stale · ${rejections.coinFlip} coin-flip · ${rejections.blacklisted} blacklisted · ${rejections.alreadyBetting} already-open`);
 
       // Analyze ALL matched opportunities — needed for both edge + confirmation bets
       const analyzed = [];
       const allPredictions = [];  // Store all predictions for confirmation bet scan
+      const edgeRejects = {
+        circuitBroken: 0,
+        lowModelProb: 0,
+        lowEdge: 0,
+        lowConfidence: 0,
+        underdog: 0,
+      };
 
       for (const opp of opportunities) {
         try {
@@ -890,17 +916,17 @@ async function runBot() {
           allPredictions.push({ opp, pred, pickSide, ourProb, marketProb, edge });
 
           // Edge bet filters — only if circuit breaker is NOT active
-          if (circuitBroken) continue;
-          if (ourProb < MIN_OUR_PROB) continue;
+          if (circuitBroken) { edgeRejects.circuitBroken++; continue; }
+          if (ourProb < MIN_OUR_PROB) { edgeRejects.lowModelProb++; continue; }
           // Game-specific minimum edge (CS2 markets are sharper, need bigger edge)
           const gameMinEdge = GAME_TUNING[opp.match._game]?.minEdge || MIN_EDGE;
-          if (edge < gameMinEdge) continue;
-          if (pred.confidence === "low" && ourProb < 65) continue;
+          if (edge < gameMinEdge) { edgeRejects.lowEdge++; continue; }
+          if (pred.confidence === "low" && ourProb < 65) { edgeRejects.lowConfidence++; continue; }
 
           // UNDERDOG GUARD — never bet a team the market considers an underdog
           // unless our model has STRONG conviction (65%+).
           // 50% model conviction on a 30% market dog is NOT an edge, it's a coin flip.
-          if (marketProb < 45 && ourProb < 65) continue;
+          if (marketProb < 45 && ourProb < 65) { edgeRejects.underdog++; continue; }
           // Market-disagrees-hard guard — if market thinks <40%, require near-certainty
           if (marketProb < 40 && ourProb < 70) continue;
 
@@ -908,6 +934,12 @@ async function runBot() {
         } catch (e) {
           push(`⚠️ Error analyzing ${opp.t1.name} vs ${opp.t2.name}: ${e.message}`);
         }
+      }
+
+      // Show edge bet rejection breakdown so we can see why nothing passes
+      const totalEdgeRejects = Object.values(edgeRejects).reduce((a, b) => a + b, 0);
+      if (totalEdgeRejects > 0) {
+        push(`   Edge rejects: ${edgeRejects.circuitBroken} breaker · ${edgeRejects.lowModelProb} low-prob · ${edgeRejects.lowEdge} low-edge · ${edgeRejects.lowConfidence} low-conf · ${edgeRejects.underdog} underdog`);
       }
 
       // RANK by composite score: edge + time-proximity bonus
@@ -1484,6 +1516,94 @@ async function handleTelegramCommand(text) {
     return msg;
   }
 
+  if (cmd === "/scan") {
+    // Dry-run scan: show all matches in window and why each would be rejected.
+    // Does NOT place any bets.
+    try {
+      const now = new Date();
+      const [csgo, dota2, lol, polyMarkets] = await Promise.all([
+        pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        fetchAllPolymarketEsports(),
+      ]);
+      const allMatches = [
+        ...csgo.map(m => ({ ...m, _game: "csgo" })),
+        ...dota2.map(m => ({ ...m, _game: "dota2" })),
+        ...lol.map(m => ({ ...m, _game: "lol" })),
+      ];
+
+      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+      const inWindow = [];
+      for (const m of allMatches) {
+        const t1 = m.opponents?.[0]?.opponent;
+        const t2 = m.opponents?.[1]?.opponent;
+        if (!t1 || !t2) continue;
+        const hoursUntil = (new Date(m.scheduled_at) - now) / 3600000;
+        if (hoursUntil < BET_WINDOW_MIN_H || hoursUntil > BET_WINDOW_MAX_H) continue;
+        const polyOdds = matchPolymarket(polyMarkets, t1.name, t2.name) ||
+                         matchPolymarket(polyMarkets, t1.acronym || t1.name, t2.acronym || t2.name);
+        inWindow.push({ m, t1, t2, hoursUntil, polyOdds });
+      }
+
+      let msg = `🔎 <b>LIVE SCAN</b>\n`;
+      msg += `${allMatches.length} total upcoming · ${inWindow.length} in ${BET_WINDOW_MIN_H}-${BET_WINDOW_MAX_H}h window\n`;
+      msg += `${polyMarkets.length} Polymarket markets loaded\n\n`;
+
+      if (inWindow.length === 0) {
+        msg += `❌ <b>No matches in window.</b>\n\nWindow is ${BET_WINDOW_MIN_H}h to ${BET_WINDOW_MAX_H}h from now.\nNext match might be outside this range.\n\n`;
+        const next = allMatches.filter(m => m.opponents?.length === 2 && new Date(m.scheduled_at) > now)
+          .sort((a, b) => new Date(a.scheduled_at) - new Date(b.scheduled_at))[0];
+        if (next) {
+          const h = ((new Date(next.scheduled_at) - now) / 3600000).toFixed(1);
+          msg += `Next match: ${next.opponents[0].opponent?.name} vs ${next.opponents[1].opponent?.name} in <b>${h}h</b>`;
+        }
+        return msg;
+      }
+
+      // Show each match in window with its status
+      msg += `<b>MATCHES IN WINDOW (sorted by time):</b>\n`;
+      inWindow.sort((a, b) => a.hoursUntil - b.hoursUntil);
+      for (let i = 0; i < Math.min(inWindow.length, 10); i++) {
+        const x = inWindow[i];
+        const game = GLABEL[x.m._game] || x.m._game;
+        const teams = `${x.t1.acronym || x.t1.name} vs ${x.t2.acronym || x.t2.name}`;
+        const h = x.hoursUntil.toFixed(1);
+        let status = "";
+        if (!x.polyOdds) {
+          status = "❌ no Polymarket match";
+        } else {
+          const liq = x.polyOdds.liquidity;
+          const maxProb = Math.max(x.polyOdds.probA, x.polyOdds.probB);
+          const stale = x.polyOdds.hoursSinceUpdate !== null && x.polyOdds.hoursSinceUpdate > 2;
+          if (liq < MIN_LIQUIDITY) status = `❌ liq $${liq.toFixed(0)} < $${MIN_LIQUIDITY}`;
+          else if (stale) status = `❌ stale (${x.polyOdds.hoursSinceUpdate.toFixed(1)}h)`;
+          else if (maxProb < PRICE_DISCOVERY_MIN) status = `❌ coin-flip (${maxProb.toFixed(0)}%)`;
+          else status = `✅ ${maxProb.toFixed(0)}% fav · $${liq.toFixed(0)} liq`;
+        }
+        msg += `${i + 1}. [${game}] ${teams} · ${h}h\n   ${status}\n`;
+      }
+      if (inWindow.length > 10) msg += `\n... and ${inWindow.length - 10} more\n`;
+
+      // Stats
+      const withOdds = inWindow.filter(x => x.polyOdds).length;
+      const passedLiq = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY).length;
+      const notStale = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY && (x.polyOdds.hoursSinceUpdate === null || x.polyOdds.hoursSinceUpdate <= 2)).length;
+      const hasSignal = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY && Math.max(x.polyOdds.probA, x.polyOdds.probB) >= PRICE_DISCOVERY_MIN).length;
+
+      msg += `\n<b>FUNNEL:</b>\n`;
+      msg += `   In window: ${inWindow.length}\n`;
+      msg += `   With Polymarket odds: ${withOdds}\n`;
+      msg += `   Pass liquidity ($${MIN_LIQUIDITY}): ${passedLiq}\n`;
+      msg += `   Not stale: ${notStale}\n`;
+      msg += `   Pass price discovery (${PRICE_DISCOVERY_MIN}%): ${hasSignal}\n`;
+
+      return msg;
+    } catch (e) {
+      return `❌ Scan failed: ${e.message}`;
+    }
+  }
+
   if (cmd === "/analyze" || cmd === "/losses") {
     const closed = state.closedPositions || [];
     const losses = closed.filter(p => p.result === "loss");
@@ -1640,6 +1760,7 @@ async function handleTelegramCommand(text) {
       `/status — Bankroll, P&L, win rate\n` +
       `/summary — Full analytics + bot vs market\n` +
       `/analyze — Deep-dive loss analysis + insights\n` +
+      `/scan — Dry-run scan: show why matches are/aren't passing\n` +
       `/run — Trigger a bot run now\n` +
       `/deploy — Pull latest code + restart\n` +
       `/cancel — Cancel all open positions\n` +
