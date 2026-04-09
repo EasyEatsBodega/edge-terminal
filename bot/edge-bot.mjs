@@ -1406,15 +1406,28 @@ async function handleTelegramCommand(text) {
     try {
       const repoDir = join(__dirname, "..");
       const pullResult = execSync("git pull", { cwd: repoDir, timeout: 30000 }).toString().trim();
-      if (pullResult.includes("Already up to date")) {
-        return "✅ Already up to date. No changes to deploy.";
-      }
-      await sendTG(`🚀 <b>DEPLOYING</b>\n\n<code>${pullResult}</code>\n\nRestarting bot in 2 seconds...`);
-      // Give Telegram time to send the message, then exit — systemd will auto-restart us
+      const alreadyUpToDate = pullResult.includes("Already up to date");
+      const msg = alreadyUpToDate
+        ? "✅ Already up to date — forcing restart to pick up any uncommitted changes."
+        : `🚀 <b>DEPLOYING</b>\n\n<code>${pullResult}</code>\n\nRestarting bot in 2 seconds...`;
+      await sendTG(msg);
+      // ALWAYS restart — even if no code changes. This ensures the bot is running latest code.
       setTimeout(() => process.exit(0), 2000);
       return null; // Don't send another message
     } catch (e) {
       return `❌ Deploy failed: ${e.message}`;
+    }
+  }
+
+  if (cmd === "/version") {
+    try {
+      const repoDir = join(__dirname, "..");
+      const hash = execSync("git rev-parse --short HEAD", { cwd: repoDir }).toString().trim();
+      const msg = execSync("git log -1 --pretty=%s", { cwd: repoDir }).toString().trim();
+      const date = execSync("git log -1 --pretty=%ci", { cwd: repoDir }).toString().trim();
+      return `🔖 <b>VERSION</b>\n\nCommit: <code>${hash}</code>\n${msg}\n${date}`;
+    } catch (e) {
+      return `❌ ${e.message}`;
     }
   }
 
@@ -1517,6 +1530,8 @@ async function handleTelegramCommand(text) {
   }
 
   if (cmd === "/scan") {
+    // Escape HTML chars that would break Telegram parse mode
+    const esc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     // Dry-run scan: show all matches in window and why each would be rejected.
     // Does NOT place any bets.
     try {
@@ -1551,12 +1566,14 @@ async function handleTelegramCommand(text) {
       msg += `${polyMarkets.length} Polymarket markets loaded\n\n`;
 
       if (inWindow.length === 0) {
-        msg += `❌ <b>No matches in window.</b>\n\nWindow is ${BET_WINDOW_MIN_H}h to ${BET_WINDOW_MAX_H}h from now.\nNext match might be outside this range.\n\n`;
+        msg += `❌ <b>No matches in window.</b>\n\nWindow is ${BET_WINDOW_MIN_H}h to ${BET_WINDOW_MAX_H}h from now.\n\n`;
         const next = allMatches.filter(m => m.opponents?.length === 2 && new Date(m.scheduled_at) > now)
           .sort((a, b) => new Date(a.scheduled_at) - new Date(b.scheduled_at))[0];
         if (next) {
           const h = ((new Date(next.scheduled_at) - now) / 3600000).toFixed(1);
-          msg += `Next match: ${next.opponents[0].opponent?.name} vs ${next.opponents[1].opponent?.name} in <b>${h}h</b>`;
+          const t1name = esc(next.opponents[0].opponent?.name || "?");
+          const t2name = esc(next.opponents[1].opponent?.name || "?");
+          msg += `Next match: ${t1name} vs ${t2name} in <b>${h}h</b>`;
         }
         return msg;
       }
@@ -1567,7 +1584,7 @@ async function handleTelegramCommand(text) {
       for (let i = 0; i < Math.min(inWindow.length, 10); i++) {
         const x = inWindow[i];
         const game = GLABEL[x.m._game] || x.m._game;
-        const teams = `${x.t1.acronym || x.t1.name} vs ${x.t2.acronym || x.t2.name}`;
+        const teams = `${esc(x.t1.acronym || x.t1.name)} vs ${esc(x.t2.acronym || x.t2.name)}`;
         const h = x.hoursUntil.toFixed(1);
         let status = "";
         if (!x.polyOdds) {
@@ -1576,7 +1593,7 @@ async function handleTelegramCommand(text) {
           const liq = x.polyOdds.liquidity;
           const maxProb = Math.max(x.polyOdds.probA, x.polyOdds.probB);
           const stale = x.polyOdds.hoursSinceUpdate !== null && x.polyOdds.hoursSinceUpdate > 2;
-          if (liq < MIN_LIQUIDITY) status = `❌ liq $${liq.toFixed(0)} < $${MIN_LIQUIDITY}`;
+          if (liq < MIN_LIQUIDITY) status = `❌ liq $${liq.toFixed(0)} &lt; $${MIN_LIQUIDITY}`;
           else if (stale) status = `❌ stale (${x.polyOdds.hoursSinceUpdate.toFixed(1)}h)`;
           else if (maxProb < PRICE_DISCOVERY_MIN) status = `❌ coin-flip (${maxProb.toFixed(0)}%)`;
           else status = `✅ ${maxProb.toFixed(0)}% fav · $${liq.toFixed(0)} liq`;
@@ -1598,9 +1615,12 @@ async function handleTelegramCommand(text) {
       msg += `   Not stale: ${notStale}\n`;
       msg += `   Pass price discovery (${PRICE_DISCOVERY_MIN}%): ${hasSignal}\n`;
 
+      // Truncate if over Telegram limit
+      if (msg.length > 3800) msg = msg.slice(0, 3800) + "\n\n[truncated]";
+
       return msg;
     } catch (e) {
-      return `❌ Scan failed: ${e.message}`;
+      return `❌ Scan failed: ${esc(e.message)}`;
     }
   }
 
