@@ -36,6 +36,7 @@ const INITIAL_BANKROLL = 1000;
 const MAX_DEPLOYED_PCT = 35;         // Allow more deployment for volume
 const MAX_POSITIONS = 10;            // More concurrent positions for action
 const MIN_EDGE = 5;                  // Need real edge vs market, not 3% noise
+const MAX_EDGE = 25;                 // SANITY CHECK: edges >25% indicate wrong market matched
 const MAX_BET_PCT = 5;               // Smaller max bet — survival first
 const MIN_BET = 5;
 const BET_WINDOW_MIN_H = -1.5;       // Allow live betting up to 90min into match
@@ -205,56 +206,128 @@ async function fetchAllPolymarketEsports() {
   return deduped;
 }
 
-function matchPolymarket(polyMarkets, teamA, teamB) {
-  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+// Score how well a Polymarket market matches a given team pair.
+// Returns 0 if not a real match-winner market, higher scores for better matches.
+function scoreMarketMatch(mkt, teamA, teamB) {
+  const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const a = norm(teamA);
   const b = norm(teamB);
+  if (!a || !b || a.length < 2 || b.length < 2) return 0;
 
-  for (const mkt of polyMarkets) {
-    const question = norm(mkt.question || "");
-    const rawOutcomes = typeof mkt.outcomes === "string" ? JSON.parse(mkt.outcomes) : (mkt.outcomes || []);
-    const outcomes = rawOutcomes.map(o => norm(String(o)));
-    const allText = question + " " + outcomes.join(" ");
-    const hasA = allText.includes(a) || outcomes.some(o => o.includes(a) || a.includes(o));
-    const hasB = allText.includes(b) || outcomes.some(o => o.includes(b) || b.includes(o));
+  const question = norm(mkt.question || "");
+  const rawOutcomes = typeof mkt.outcomes === "string" ? JSON.parse(mkt.outcomes) : (mkt.outcomes || []);
+  const outcomes = rawOutcomes.map(o => norm(String(o)));
 
-    if (hasA && hasB && mkt.outcomePrices) {
-      const prices = typeof mkt.outcomePrices === "string" ? JSON.parse(mkt.outcomePrices) : mkt.outcomePrices;
-      if (prices.length >= 2) {
-        const o0 = outcomes[0] || "";
-        const aIsFirst = o0.includes(a) || a.includes(o0);
-        const probFirst = parseFloat(prices[0]) * 100;
-        const probSecond = parseFloat(prices[1]) * 100;
-        const liquidity = parseFloat(mkt.liquidity) || 0;
-        const volume = parseFloat(mkt.volume) || 0;
-        const slug = mkt.slug || "";
-        const polyUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+  // Reject markets that aren't "Team A vs Team B" style moneylines
+  // Look for disqualifying keywords in the question — these indicate prop/specialty markets.
+  const rawQ = (mkt.question || "").toLowerCase();
+  const badKeywords = ["map ", "2-0", "2-1", "3-0", "3-1", "3-2", "total maps", "will any", "any map", "first blood", "first kill", "first to", "number of maps", "correct score", "exact score", "over under", "over/under", "parlay"];
+  if (badKeywords.some(kw => rawQ.includes(kw))) return 0;
 
-        // Spread: how far apart are the two outcome prices? Tight = confident market.
-        const spread = Math.abs(probFirst - probSecond);
+  // Require a "vs" or "versus" in the question for match-winner markets
+  if (!rawQ.includes("vs") && !rawQ.includes("versus")) return 0;
 
-        // Market freshness: how recently was this market updated?
-        const updatedAt = mkt.updated_at || mkt.lastTradeTimestamp || null;
-        const hoursSinceUpdate = updatedAt ? (Date.now() - new Date(updatedAt).getTime()) / 3600000 : null;
+  // Must have exactly 2 outcomes for a head-to-head moneyline
+  if (outcomes.length !== 2) return 0;
 
-        // Volume quality: higher volume = more reliable pricing
-        const volumePerLiq = liquidity > 0 ? volume / liquidity : 0;
+  // Scoring system — we want EXACT or near-exact team name matches
+  let score = 0;
 
-        return {
-          probA: aIsFirst ? probFirst : probSecond,
-          probB: aIsFirst ? probSecond : probFirst,
-          liquidity,
-          volume,
-          spread,
-          hoursSinceUpdate,
-          volumePerLiq,
-          slug,
-          polyUrl,
-        };
-      }
+  // Exact match to an outcome = best
+  const aExact = outcomes.some(o => o === a);
+  const bExact = outcomes.some(o => o === b);
+  if (aExact) score += 100;
+  if (bExact) score += 100;
+
+  // Outcome contains team name or vice versa (weaker)
+  // But require minimum 3-char overlap to avoid "TE" matching "team"
+  if (!aExact) {
+    const aMatch = outcomes.find(o => (o.length >= 3 && a.length >= 3) && (o.includes(a) || a.includes(o)));
+    if (aMatch) {
+      // Prefer matches where one is a prefix/suffix of the other (stronger match)
+      const overlap = Math.min(aMatch.length, a.length);
+      const longer = Math.max(aMatch.length, a.length);
+      score += Math.round((overlap / longer) * 50);
     }
   }
-  return null;
+  if (!bExact) {
+    const bMatch = outcomes.find(o => (o.length >= 3 && b.length >= 3) && (o.includes(b) || b.includes(o)));
+    if (bMatch) {
+      const overlap = Math.min(bMatch.length, b.length);
+      const longer = Math.max(bMatch.length, b.length);
+      score += Math.round((overlap / longer) * 50);
+    }
+  }
+
+  // Question text also mentions both teams — bonus
+  if (question.includes(a) && question.includes(b)) score += 20;
+
+  // BOTH teams must be matched somehow for this to count
+  if (score < 50) return 0;  // At minimum one exact match OR two strong partials
+
+  return score;
+}
+
+function matchPolymarket(polyMarkets, teamA, teamB) {
+  const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const a = norm(teamA);
+  const b = norm(teamB);
+  if (!a || !b) return null;
+
+  // Score every market and pick the best-matching one.
+  // Must have a score >= 100 (at least one exact match).
+  let best = null;
+  let bestScore = 99; // require > 99 to avoid returning partial/ambiguous matches
+
+  for (const mkt of polyMarkets) {
+    if (!mkt.outcomePrices) continue;
+    const score = scoreMarketMatch(mkt, teamA, teamB);
+    if (score > bestScore) {
+      bestScore = score;
+      best = mkt;
+    }
+  }
+
+  if (!best) return null;
+
+  const rawOutcomes = typeof best.outcomes === "string" ? JSON.parse(best.outcomes) : (best.outcomes || []);
+  const outcomes = rawOutcomes.map(o => norm(String(o)));
+  const prices = typeof best.outcomePrices === "string" ? JSON.parse(best.outcomePrices) : best.outcomePrices;
+  if (prices.length < 2) return null;
+
+  // Figure out which outcome is team A based on direct match
+  const o0 = outcomes[0] || "";
+  const o1 = outcomes[1] || "";
+  // Score each outcome's match to team A
+  const aScore0 = o0 === a ? 2 : (o0.includes(a) || a.includes(o0)) ? 1 : 0;
+  const aScore1 = o1 === a ? 2 : (o1.includes(a) || a.includes(o1)) ? 1 : 0;
+  const aIsFirst = aScore0 >= aScore1;
+
+  const probFirst = parseFloat(prices[0]) * 100;
+  const probSecond = parseFloat(prices[1]) * 100;
+  const liquidity = parseFloat(best.liquidity) || 0;
+  const volume = parseFloat(best.volume) || 0;
+  const slug = best.slug || "";
+  const polyUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+
+  const spread = Math.abs(probFirst - probSecond);
+  const updatedAt = best.updated_at || best.lastTradeTimestamp || null;
+  const hoursSinceUpdate = updatedAt ? (Date.now() - new Date(updatedAt).getTime()) / 3600000 : null;
+  const volumePerLiq = liquidity > 0 ? volume / liquidity : 0;
+
+  return {
+    probA: aIsFirst ? probFirst : probSecond,
+    probB: aIsFirst ? probSecond : probFirst,
+    liquidity,
+    volume,
+    spread,
+    hoursSinceUpdate,
+    volumePerLiq,
+    slug,
+    polyUrl,
+    question: best.question || "",
+    matchScore: bestScore,
+  };
 }
 
 // ─── Prediction Model (v3 — game scores, margins, dominance + recency) ─────
@@ -1026,6 +1099,13 @@ async function runBot() {
           if (edge < gameMinEdge) { edgeRejects.lowEdge++; continue; }
           if (pred.confidence === "low" && ourProb < 65) { edgeRejects.lowConfidence++; continue; }
 
+          // SANITY CHECK: absurd edges mean the market matcher found the WRONG market.
+          // A legitimate moneyline never has >25% mispricing. Reject and log.
+          if (edge > MAX_EDGE) {
+            push(`⚠️ REJECTED ${opp.t1.name} vs ${opp.t2.name}: absurd edge +${edge.toFixed(1)}% (market matcher likely found wrong market: "${opp.polyOdds.question || "?"}")`);
+            continue;
+          }
+
           // UNDERDOG GUARD — never bet a team the market considers an underdog
           // unless our model has STRONG conviction (65%+).
           // 50% model conviction on a 30% market dog is NOT an edge, it's a coin flip.
@@ -1116,11 +1196,14 @@ async function runBot() {
 
         const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
 
+        const escHtml = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const polyQuestion = a.opp.polyOdds.question ? `\n🔖 <i>${escHtml(a.opp.polyOdds.question)}</i>\n` : "";
         await sendTG(
           `💰 <b>NEW PAPER BET</b>\n\n` +
           `🎮 ${a.opp.match._game.toUpperCase()}\n` +
           `📋 ${position.event}\n` +
-          `🏆 ${position.league} · BO${position.format}\n\n` +
+          `🏆 ${position.league} · BO${position.format}` +
+          polyQuestion + `\n` +
           `<b>Pick: ${pick}</b>\n` +
           `Our model: <b>${position.ourProb}%</b>\n` +
           `Market: <b>${position.marketProb}%</b>\n` +
@@ -1177,6 +1260,14 @@ async function runBot() {
           const marketFavSide = ap.opp.polyOdds.probA >= ap.opp.polyOdds.probB ? "A" : "B";
           const marketFavProb = marketFavSide === "A" ? ap.opp.polyOdds.probA : ap.opp.polyOdds.probB;
           const ourProbForFav = marketFavSide === "A" ? ap.pred.probA : ap.pred.probB;
+
+          // SANITY CHECK: if the two market probs don't roughly sum to 100%, the market
+          // matcher found a weird prop market (like "will team win 2-0?"). Skip it.
+          const sumProb = ap.opp.polyOdds.probA + ap.opp.polyOdds.probB;
+          if (sumProb < 90 || sumProb > 110) {
+            confirmRejects.belowMarketThreshold++;
+            continue;
+          }
 
           // Live bets have a higher threshold — need the market to still strongly favor
           // our pick EVEN AFTER the game has started. This filters out upset scenarios
@@ -1246,11 +1337,14 @@ async function runBot() {
           const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
           const liveTag = isLive ? " 🔴 LIVE" : "";
           const liveNote = isLive ? `\n<i>Live bet — match in progress, half sizing applied</i>\n` : "";
+          const escHtml = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          const polyQuestion = opp.polyOdds.question ? `\n🔖 <i>${escHtml(opp.polyOdds.question)}</i>\n` : "";
           await sendTG(
             `🎯 <b>CONFIRMATION BET [${tier.label}]${liveTag}</b>\n\n` +
             `🎮 ${opp.match._game.toUpperCase()}\n` +
             `📋 ${position.event}\n` +
-            `🏆 ${position.league} · BO${position.format}\n\n` +
+            `🏆 ${position.league} · BO${position.format}` +
+            polyQuestion + `\n` +
             `<b>Pick: ${pick} (heavy favorite)</b>\n` +
             `Our model: <b>${ourProb.toFixed(1)}%</b>\n` +
             `Market: <b>${marketProb.toFixed(1)}%</b>\n` +
