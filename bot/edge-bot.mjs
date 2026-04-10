@@ -31,35 +31,35 @@ const CFG = loadConfig();
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INITIAL_BANKROLL = 1000;
-const MAX_DEPLOYED_PCT = 30;         // Allow more deployment for volume
-const MAX_POSITIONS = 8;             // More concurrent positions for action
+const MAX_DEPLOYED_PCT = 35;         // Allow more deployment for volume
+const MAX_POSITIONS = 10;            // More concurrent positions for action
 const MIN_EDGE = 5;                  // Need real edge vs market, not 3% noise
 const MAX_BET_PCT = 5;               // Smaller max bet — survival first
 const MIN_BET = 5;
-const BET_WINDOW_MIN_H = 0.5;        // 30min minimum — need settled odds
-const BET_WINDOW_MAX_H = 6;          // 6h max window
+const BET_WINDOW_MIN_H = 0.25;       // 15min minimum — get in closer to game time
+const BET_WINDOW_MAX_H = 8;          // 8h max window — more matches in scope
 const PRIORITY_WINDOW_H = 3;         // Matches within 3h get priority ranking
-const MIN_LIQUIDITY = 2000;          // Real liquidity only — thin markets = bad prices
+const MIN_LIQUIDITY = 1500;          // Lowered from $2k — esports markets can be thinner
 const MIN_OUR_PROB = 60;             // Keep — only bet confident picks
 const BETS_PER_RUN = 3;              // Up to 3 edge bets per run
-const PRICE_DISCOVERY_MIN = 58;      // Market must show some signal (not coin-flip territory)
+const PRICE_DISCOVERY_MIN = 55;      // Lowered from 58 — catch slight favorites
 
 // ─── Market Confirmation Mode ──────────────────────────────────────────────
-// When model AND market agree on a heavy favorite, take a bigger position.
+// When model AND market agree on a favorite, take a position sized by tier.
 // Esports markets tend to underprice favorites (degen bettors love underdogs).
-// These are our "safe" plays — both signals agree, so size up.
-// TIERED: 85%+ lock = bigger bet, 72-84% = standard bet.
+// TIERED: heavy consensus = bigger bet, slight consensus = tiny grind bet.
 const CONFIRM_ENABLED = true;
-const CONFIRM_MIN_MARKET_PROB = 72;  // Market must see team as 72%+ favorite
-const CONFIRM_MIN_OUR_PROB = 70;     // Our model must also agree (70%+)
-const CONFIRM_MIN_LIQUIDITY = 3000;  // Higher liquidity required — need reliable prices
-const CONFIRM_MAX_PER_RUN = 3;       // Up to 3 confirmation bets per run
+const CONFIRM_MIN_MARKET_PROB = 65;  // Market must see team as 65%+ favorite (lowered from 72)
+const CONFIRM_MIN_OUR_PROB = 63;     // Our model must also agree (lowered from 70)
+const CONFIRM_MIN_LIQUIDITY = 2000;  // Match edge filter (lowered from 3000)
+const CONFIRM_MAX_PER_RUN = 4;       // Up to 4 confirmation bets per run (raised from 3)
 
 // Tiered sizing — stronger consensus = bigger position
 const CONFIRM_TIERS = [
   { minMarket: 85, minModel: 82, pct: 8, label: "LOCK" },     // 85%+ market + 82%+ model = 8% bankroll
   { minMarket: 78, minModel: 76, pct: 6, label: "STRONG" },   // 78%+ = 6%
-  { minMarket: 72, minModel: 70, pct: 4, label: "LEAN" },     // 72%+ = 4% (base tier)
+  { minMarket: 72, minModel: 70, pct: 4, label: "LEAN" },     // 72%+ = 4%
+  { minMarket: 65, minModel: 63, pct: 2, label: "MICRO" },    // 65%+ = 2% (NEW — slight favorites grind)
 ];
 
 // ─── Game-Specific Adjustments ─────────────────────────────────────────────
@@ -858,8 +858,9 @@ async function runBot() {
           continue;
         }
 
-        // FILTER: Skip stale markets — if not updated in 2+ hours, prices may be unreliable
-        if (polyOdds.hoursSinceUpdate !== null && polyOdds.hoursSinceUpdate > 2) {
+        // FILTER: Skip stale markets — if not updated in 3+ hours, prices may be unreliable
+        // (Extended from 2h — esports markets don't always update frequently)
+        if (polyOdds.hoursSinceUpdate !== null && polyOdds.hoursSinceUpdate > 3) {
           rejections.staleMarket++;
           continue;
         }
@@ -1592,7 +1593,7 @@ async function handleTelegramCommand(text) {
         } else {
           const liq = x.polyOdds.liquidity;
           const maxProb = Math.max(x.polyOdds.probA, x.polyOdds.probB);
-          const stale = x.polyOdds.hoursSinceUpdate !== null && x.polyOdds.hoursSinceUpdate > 2;
+          const stale = x.polyOdds.hoursSinceUpdate !== null && x.polyOdds.hoursSinceUpdate > 3;
           if (liq < MIN_LIQUIDITY) status = `❌ liq $${liq.toFixed(0)} &lt; $${MIN_LIQUIDITY}`;
           else if (stale) status = `❌ stale (${x.polyOdds.hoursSinceUpdate.toFixed(1)}h)`;
           else if (maxProb < PRICE_DISCOVERY_MIN) status = `❌ coin-flip (${maxProb.toFixed(0)}%)`;
@@ -1605,7 +1606,7 @@ async function handleTelegramCommand(text) {
       // Stats
       const withOdds = inWindow.filter(x => x.polyOdds).length;
       const passedLiq = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY).length;
-      const notStale = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY && (x.polyOdds.hoursSinceUpdate === null || x.polyOdds.hoursSinceUpdate <= 2)).length;
+      const notStale = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY && (x.polyOdds.hoursSinceUpdate === null || x.polyOdds.hoursSinceUpdate <= 3)).length;
       const hasSignal = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY && Math.max(x.polyOdds.probA, x.polyOdds.probB) >= PRICE_DISCOVERY_MIN).length;
 
       msg += `\n<b>FUNNEL:</b>\n`;
