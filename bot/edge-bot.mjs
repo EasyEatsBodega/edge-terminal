@@ -38,9 +38,12 @@ const MAX_POSITIONS = 10;            // More concurrent positions for action
 const MIN_EDGE = 5;                  // Need real edge vs market, not 3% noise
 const MAX_BET_PCT = 5;               // Smaller max bet — survival first
 const MIN_BET = 5;
-const BET_WINDOW_MIN_H = 0.25;       // 15min minimum — get in closer to game time
+const BET_WINDOW_MIN_H = -1.5;       // Allow live betting up to 90min into match
 const BET_WINDOW_MAX_H = 8;          // 8h max window — more matches in scope
 const PRIORITY_WINDOW_H = 3;         // Matches within 3h get priority ranking
+const LIVE_ONLY_THRESHOLD_H = 0;     // Matches with hoursUntil < 0 are "live"
+const LIVE_MIN_MARKET_PROB = 75;     // Live bets: must still be 75%+ favorite
+const LIVE_SIZE_MULTIPLIER = 0.5;    // Live bets: half-size due to variance
 const MIN_LIQUIDITY = 1500;          // Lowered from $2k — esports markets can be thinner
 const MIN_OUR_PROB = 60;             // Keep — only bet confident picks
 const BETS_PER_RUN = 3;              // Up to 3 edge bets per run
@@ -61,8 +64,22 @@ const CONFIRM_TIERS = [
   { minMarket: 85, minModel: 82, pct: 8, label: "LOCK" },     // 85%+ market + 82%+ model = 8% bankroll
   { minMarket: 78, minModel: 76, pct: 6, label: "STRONG" },   // 78%+ = 6%
   { minMarket: 72, minModel: 70, pct: 4, label: "LEAN" },     // 72%+ = 4%
-  { minMarket: 65, minModel: 63, pct: 2, label: "MICRO" },    // 65%+ = 2% (NEW — slight favorites grind)
+  { minMarket: 65, minModel: 63, pct: 2, label: "MICRO" },    // 65%+ = 2% (slight favorites grind)
 ];
+
+// ─── FADE Strategy (Live Betting) ──────────────────────────────────────────
+// When a pre-match heavy favorite drops significantly mid-match, the market
+// is often overreacting to early losses. A team that was 80% pre-match and
+// is now 60% mid-BO3 after losing game 1 might still have a 65-70% true
+// probability — we can buy the favorite at a live discount.
+const FADE_ENABLED = true;
+const FADE_MIN_PREMATCH_PROB = 75;   // Was a heavy favorite pre-match
+const FADE_MIN_DROP_PCT = 8;         // Price dropped at least 8% live
+const FADE_MIN_CURRENT_PROB = 50;    // Still at least a coin flip (not a total collapse)
+const FADE_MAX_CURRENT_PROB = 72;    // Below this, it's discounted enough to matter
+const FADE_BET_PCT = 3;              // 3% of bankroll per fade bet
+const FADE_MAX_PER_RUN = 2;          // Up to 2 fade bets per run
+const FADE_MIN_LIQUIDITY = 2500;     // Need real liquidity for live bets
 
 // ─── Game-Specific Adjustments ─────────────────────────────────────────────
 // Each game plays very differently. One model doesn't fit all.
@@ -715,7 +732,13 @@ async function runBot() {
     // Fetch Polymarket data once for resolution fallback + live prices
     const polyMarketsForResolve = await fetchAllPolymarketEsports();
 
-    const toResolve = state.openPositions.filter(p => new Date(p.matchTime) < new Date(now - 1800000));
+    // Resolve matches started 30+ min ago, BUT for live/fade bets wait longer
+    // (BO3 matches take 60-90 min, we don't want to resolve before they finish)
+    const toResolve = state.openPositions.filter(p => {
+      const matchStart = new Date(p.matchTime);
+      const resolveDelayMin = (p.betType === "fade" || p.isLive) ? 90 : 30;
+      return matchStart < new Date(now - resolveDelayMin * 60000);
+    });
     const stillOpen = [];
     let resolvedCount = 0;
 
@@ -900,6 +923,27 @@ async function runBot() {
         if (!polyOdds) {
           rejections.noPolyOdds++;
           continue;
+        }
+
+        // ─── Pre-match price capture (for FADE strategy) ───────────────
+        // If this match hasn't started yet, record its current price as the
+        // "pre-match" baseline. Later, when the match goes live, we compare
+        // the live price against this baseline to detect big drops.
+        const hoursUntilMatch = (matchTime - now) / 3600000;
+        if (hoursUntilMatch > 0) {
+          if (!state.prematchPrices) state.prematchPrices = {};
+          // Only record the FIRST/HIGHEST price we see — that's the "true" pre-match peak
+          const existing = state.prematchPrices[m.id];
+          const maxProb = Math.max(polyOdds.probA, polyOdds.probB);
+          if (!existing || maxProb > Math.max(existing.probA, existing.probB)) {
+            state.prematchPrices[m.id] = {
+              probA: polyOdds.probA,
+              probB: polyOdds.probB,
+              capturedAt: now.toISOString(),
+              teamA: t1.name,
+              teamB: t2.name,
+            };
+          }
         }
 
         // FILTER: Skip low-liquidity markets — prices are meaningless without real money behind them
@@ -1124,14 +1168,21 @@ async function runBot() {
           // Already placed an edge bet on this match?
           if (betsPlaced.some(b => b.matchId === ap.opp.match.id)) { confirmRejects.dupEdgeBet++; continue; }
 
+          // Detect if this is a LIVE bet (match has already started)
+          const hoursUntilMatch = (new Date(ap.opp.match.scheduled_at) - now) / 3600000;
+          const isLive = hoursUntilMatch < LIVE_ONLY_THRESHOLD_H;
+
           // For confirmation bets, we need to pick the MARKET favorite, not our model's pick.
           // The thesis is "ride the market consensus" — so we bet whichever side the market favors.
           const marketFavSide = ap.opp.polyOdds.probA >= ap.opp.polyOdds.probB ? "A" : "B";
           const marketFavProb = marketFavSide === "A" ? ap.opp.polyOdds.probA : ap.opp.polyOdds.probB;
           const ourProbForFav = marketFavSide === "A" ? ap.pred.probA : ap.pred.probB;
 
-          // Market must see a clear favorite (65%+)
-          if (marketFavProb < CONFIRM_MIN_MARKET_PROB) { confirmRejects.belowMarketThreshold++; continue; }
+          // Live bets have a higher threshold — need the market to still strongly favor
+          // our pick EVEN AFTER the game has started. This filters out upset scenarios
+          // where the favorite went down and odds shifted.
+          const requiredMarketProb = isLive ? LIVE_MIN_MARKET_PROB : CONFIRM_MIN_MARKET_PROB;
+          if (marketFavProb < requiredMarketProb) { confirmRejects.belowMarketThreshold++; continue; }
 
           // Our model must not STRONGLY disagree. We allow slight disagreement — we're
           // trusting the market here, not our own model. But if our model thinks it's a
@@ -1142,7 +1193,9 @@ async function runBot() {
           // Tier is determined by MARKET probability primarily (since we're riding the market).
           // Model threshold is relaxed — just "doesn't disagree".
           const tier = CONFIRM_TIERS.find(t => marketFavProb >= t.minMarket) || CONFIRM_TIERS[CONFIRM_TIERS.length - 1];
-          const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * tier.pct / 100));
+          // Live bets get half-size due to higher variance
+          const sizeMultiplier = isLive ? LIVE_SIZE_MULTIPLIER : 1.0;
+          const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * tier.pct / 100 * sizeMultiplier));
           const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
           if (confirmSize > state.bankroll - currentDeployed) { confirmRejects.insufficientSize++; continue; }
 
@@ -1170,6 +1223,7 @@ async function runBot() {
             confidence: pred.confidence,
             betType: "confirmation",  // Tag it so we can track performance separately
             confirmTier: tier.label,
+            isLive,
             event: `${opp.t1.acronym || opp.t1.name} vs ${opp.t2.acronym || opp.t2.name}`,
             league: opp.match.league?.name || "",
             format: opp.match.number_of_games || 1,
@@ -1187,19 +1241,21 @@ async function runBot() {
           state.bankroll -= confirmSize;
           confirmBets++;
 
-          push(`🎯 CONFIRM [${tier.label}]: ${pick} in ${position.event} | Model: ${ourProb.toFixed(1)}% | Market: ${marketProb.toFixed(1)}% | Size: $${confirmSize} (${tier.pct}%)`);
+          push(`🎯 CONFIRM [${tier.label}${isLive ? " LIVE" : ""}]: ${pick} in ${position.event} | Model: ${ourProb.toFixed(1)}% | Market: ${marketProb.toFixed(1)}% | Size: $${confirmSize}`);
 
           const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
+          const liveTag = isLive ? " 🔴 LIVE" : "";
+          const liveNote = isLive ? `\n<i>Live bet — match in progress, half sizing applied</i>\n` : "";
           await sendTG(
-            `🎯 <b>CONFIRMATION BET [${tier.label}]</b>\n\n` +
+            `🎯 <b>CONFIRMATION BET [${tier.label}]${liveTag}</b>\n\n` +
             `🎮 ${opp.match._game.toUpperCase()}\n` +
             `📋 ${position.event}\n` +
             `🏆 ${position.league} · BO${position.format}\n\n` +
             `<b>Pick: ${pick} (heavy favorite)</b>\n` +
             `Our model: <b>${ourProb.toFixed(1)}%</b>\n` +
             `Market: <b>${marketProb.toFixed(1)}%</b>\n` +
-            `Both agree — taking the chalk.\n\n` +
-            `💵 Bet: <b>$${confirmSize}</b> (${tier.pct}% bankroll — ${tier.label})\n` +
+            `Both agree — taking the chalk.${liveNote}\n` +
+            `💵 Bet: <b>$${confirmSize}</b> (${tier.pct}% bankroll — ${tier.label}${isLive ? " × 0.5 live" : ""})\n` +
             `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>` +
             polyLink
           );
@@ -1212,6 +1268,117 @@ async function runBot() {
         }
         if (confirmBets === 0 && allPredictions.length > 0) {
           push(`   📭 No confirmation bets placed this run`);
+        }
+      }
+
+      // ─── FADE Bets (Live, Discounted Former Favorites) ──────────────────
+      // A team that was a heavy pre-match favorite but has dropped significantly
+      // live (because they're losing early games in a BO3) is often underpriced.
+      // Market overreacts. Take the former favorite at a discount.
+      if (FADE_ENABLED && state.openPositions.length < MAX_POSITIONS) {
+        let fadeBets = 0;
+        for (const ap of allPredictions) {
+          if (fadeBets >= FADE_MAX_PER_RUN) break;
+          if (state.openPositions.length >= MAX_POSITIONS) break;
+
+          const opp = ap.opp;
+          const hoursUntilMatch = (new Date(opp.match.scheduled_at) - now) / 3600000;
+          // Only live matches (started already, within our live window)
+          if (hoursUntilMatch >= 0) continue;
+
+          // Must have pre-match data to compare
+          const prematch = state.prematchPrices?.[opp.match.id];
+          if (!prematch) continue;
+
+          // Skip if we already have a position on this match
+          if (state.openPositions.some(p => p.matchId === opp.match.id)) continue;
+          if (betsPlaced.some(b => b.matchId === opp.match.id)) continue;
+          if ((opp.polyOdds.liquidity || 0) < FADE_MIN_LIQUIDITY) continue;
+
+          // Find which side was the pre-match favorite
+          const prematchFavSide = prematch.probA >= prematch.probB ? "A" : "B";
+          const prematchFavProb = prematchFavSide === "A" ? prematch.probA : prematch.probB;
+          const currentFavProb = prematchFavSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
+
+          // Pre-match must have been a heavy favorite
+          if (prematchFavProb < FADE_MIN_PREMATCH_PROB) continue;
+
+          // Price must have dropped significantly
+          const drop = prematchFavProb - currentFavProb;
+          if (drop < FADE_MIN_DROP_PCT) continue;
+
+          // Current price must be in the "discount" zone (not a total collapse)
+          if (currentFavProb < FADE_MIN_CURRENT_PROB || currentFavProb > FADE_MAX_CURRENT_PROB) continue;
+
+          // Place the fade bet — bet on the former favorite at the discounted price
+          const fadeSize = Math.max(MIN_BET, Math.round(state.bankroll * FADE_BET_PCT / 100));
+          const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
+          if (fadeSize > state.bankroll - currentDeployed) continue;
+
+          const pick = prematchFavSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
+          const ourProb = prematchFavSide === "A" ? ap.pred.probA : ap.pred.probB;
+
+          const position = {
+            id: `fade_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            matchId: opp.match.id,
+            game: opp.match._game,
+            teamA: opp.t1.acronym || opp.t1.name,
+            teamB: opp.t2.acronym || opp.t2.name,
+            teamAId: opp.t1.id,
+            teamBId: opp.t2.id,
+            pick, pickSide: prematchFavSide,
+            ourProb: +ourProb.toFixed(1),
+            marketProb: +currentFavProb.toFixed(1),
+            prematchProb: +prematchFavProb.toFixed(1),
+            edge: +(prematchFavProb - currentFavProb).toFixed(1),
+            betSize: fadeSize,
+            betPercent: +(fadeSize / state.bankroll * 100).toFixed(1),
+            confidence: ap.pred.confidence,
+            betType: "fade",
+            isLive: true,
+            event: `${opp.t1.acronym || opp.t1.name} vs ${opp.t2.acronym || opp.t2.name}`,
+            league: opp.match.league?.name || "",
+            format: opp.match.number_of_games || 1,
+            placedAt: now.toISOString(),
+            matchTime: opp.match.scheduled_at,
+            thesis: `FADE BET: ${pick} was ${prematchFavProb.toFixed(0)}% pre-match, now ${currentFavProb.toFixed(0)}% live. Market overreacting to early game loss — buying the former favorite at a ${drop.toFixed(0)}% discount.`,
+            polyUrl: opp.polyOdds.polyUrl || null,
+            polyLiquidity: opp.polyOdds.liquidity,
+            matchStatus: "live",
+          };
+
+          state.openPositions.push(position);
+          state.bankroll -= fadeSize;
+          fadeBets++;
+
+          push(`🔄 FADE: ${pick} in ${position.event} | Prematch: ${prematchFavProb.toFixed(0)}% → Live: ${currentFavProb.toFixed(0)}% (−${drop.toFixed(0)}%) | Size: $${fadeSize}`);
+
+          const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
+          await sendTG(
+            `🔄 <b>FADE BET 🔴 LIVE</b>\n\n` +
+            `🎮 ${opp.match._game.toUpperCase()}\n` +
+            `📋 ${position.event}\n` +
+            `🏆 ${position.league} · BO${position.format}\n\n` +
+            `<b>Pick: ${pick}</b> (former favorite)\n` +
+            `Pre-match: <b>${prematchFavProb.toFixed(0)}%</b>\n` +
+            `Live now: <b>${currentFavProb.toFixed(0)}%</b>\n` +
+            `Drop: <b>−${drop.toFixed(0)}%</b> — market overreacting\n\n` +
+            `💵 Bet: <b>$${fadeSize}</b> (${FADE_BET_PCT}% bankroll)\n` +
+            `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n` +
+            `📝 <i>${position.thesis}</i>` +
+            polyLink
+          );
+        }
+        if (fadeBets > 0) push(`🔄 Placed ${fadeBets} fade bet${fadeBets > 1 ? "s" : ""} on discounted former favorites`);
+      }
+
+      // Clean up stale pre-match price cache (keep only last 7 days)
+      if (state.prematchPrices) {
+        const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
+        for (const id of Object.keys(state.prematchPrices)) {
+          if (state.prematchPrices[id].capturedAt < cutoff) {
+            delete state.prematchPrices[id];
+          }
         }
       }
     } else {
