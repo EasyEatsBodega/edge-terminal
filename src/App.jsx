@@ -373,32 +373,49 @@ export default function App() {
   const [botUrlInput, setBotUrlInput] = useState(() => load("botUrl", "") || "http://142.93.228.49:3069");
   const [botRunning, setBotRunning] = useState(false);
 
+  // Helper: build a request URL. On HTTPS (production) we MUST proxy through
+  // /api/bot-proxy because browsers block HTTPS→HTTP mixed content. On HTTP
+  // (local dev) we can fetch the bot directly.
+  const buildBotUrl = useCallback((path) => {
+    const isHttps = typeof window !== "undefined" && window.location.protocol === "https:";
+    const botIsHttp = botUrl.startsWith("http://");
+    if (isHttps && botIsHttp) {
+      // Proxy through Vercel API route
+      const params = new URLSearchParams({ path, secret: botSecret, botUrl });
+      return `/api/bot-proxy?${params.toString()}`;
+    }
+    // Direct fetch — only works when both dashboard and bot are HTTP, or both HTTPS
+    const base = botUrl.replace(/\/+$/, "");
+    return `${base}/${path}?secret=${encodeURIComponent(botSecret)}`;
+  }, [botUrl, botSecret]);
+
   const loadBotState = useCallback(async () => {
     if (!botSecret || !botUrl) return;
     setBotLoading(true);
     try {
-      const base = botUrl.replace(/\/+$/, "");
-      const r = await fetch(`${base}/state?secret=${encodeURIComponent(botSecret)}`);
+      const r = await fetch(buildBotUrl("state"));
       if (!r.ok) throw new Error(`${r.status}`);
       setBotState(await r.json());
     } catch (e) { console.error("Bot state fetch failed:", e); }
     finally { setBotLoading(false); }
-  }, [botSecret, botUrl]);
+  }, [botSecret, botUrl, buildBotUrl]);
 
   const triggerBotRun = useCallback(async () => {
     if (!botSecret || !botUrl) return;
     setBotRunning(true);
     try {
-      const base = botUrl.replace(/\/+$/, "");
-      const r = await fetch(`${base}/run?secret=${encodeURIComponent(botSecret)}`);
+      const r = await fetch(buildBotUrl("run"));
       const data = await r.json();
       if (data.ok) await loadBotState();
       return data;
     } catch (e) { console.error("Bot run failed:", e); return { ok: false, error: e.message }; }
     finally { setBotRunning(false); }
-  }, [botSecret, botUrl, loadBotState]);
+  }, [botSecret, botUrl, loadBotState, buildBotUrl]);
 
-  useEffect(() => { if (botSecret && botUrl && view === "bot") loadBotState(); }, [botSecret, botUrl, view]);
+  useEffect(() => {
+    // Load bot state when on any view that needs it
+    if (botSecret && botUrl && (view === "bot" || view === "daily")) loadBotState();
+  }, [botSecret, botUrl, view]);
   useEffect(() => { save("botSecret", botSecret); }, [botSecret]);
   useEffect(() => { save("botUrl", botUrl); }, [botUrl]);
 
