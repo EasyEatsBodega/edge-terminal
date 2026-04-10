@@ -79,6 +79,34 @@ const BOT_CHANGELOG = {
       { type: "feature", text: "Daily Recap view — day-by-day breakdown with talking points for YouTube" },
     ],
   },
+  "2026-04-09": {
+    title: "Day 4 — Diagnostics + Volume Tuning",
+    updates: [
+      { type: "feature", text: "/analyze Telegram command — deep-dive loss breakdown by game, league, format, market range, edge size" },
+      { type: "feature", text: "Smart insights engine — auto-detects losing patterns (worst leagues, coin-flip traps, small-edge losses)" },
+      { type: "feature", text: "League auto-blacklist — leagues where we're 0-3+ over 14 days get skipped automatically" },
+      { type: "strategy", text: "Underdog guard — NEVER bet a team the market sees <45% unless model is 65%+; <40% market requires 70%+ model" },
+      { type: "lesson", text: "Discovered all historical losses were 100% CS2, 75% CCT South America, 100% on 50/50 markets, all small edges. Model was betting tier-3 regional coin-flips." },
+      { type: "strategy", text: "Volume caps bumped — max positions 5→8, deployment 20%→30%, bets/run 2→3" },
+      { type: "feature", text: "Time-based opportunity ranking — matches within 1h get +2 bonus, within 3h get +1. Soonest matches prioritized." },
+      { type: "infra", text: "Vercel cron bumped from 4h to hourly — was missing ~75% of matches" },
+    ],
+  },
+  "2026-04-10": {
+    title: "Day 5 — The Recovery + MICRO Tier",
+    updates: [
+      { type: "result", text: "FIRST CONFIRMATION BET WIN — LYNX (STRONG tier) at 78.9% model / 93.5% market, +$3.20. Bankroll $725→$748" },
+      { type: "lesson", text: "Confirmation bet strategy proven — riding market consensus on heavy favorites is generating wins where our edge model was losing" },
+      { type: "feature", text: "/scan diagnostic command — dry-run shows every match in window, why each is passing/failing, and the full funnel" },
+      { type: "feature", text: "/version command — verify exact commit deployed on VPS" },
+      { type: "fix", text: "/deploy now force-restarts the bot even when already up to date (fixed stale-code-in-memory bug)" },
+      { type: "fix", text: "/scan HTML-escapes team names (was silently failing on & < > chars)" },
+      { type: "feature", text: "Detailed rejection logging in every run — tracks exactly which filter blocked each match" },
+      { type: "strategy", text: "NEW MICRO confirmation tier — 65%+ market, 63%+ model, 2% bankroll. Catches slight favorites the old 72% threshold missed." },
+      { type: "strategy", text: "Filter loosening for more volume: liquidity $2k→$1.5k (edge) and $3k→$2k (confirm), bet window 0.5-6h→0.25-8h, staleness 2h→3h, price discovery 58%→55%" },
+      { type: "strategy", text: "Volume caps: max positions 8→10, deployment 30%→35%, confirmation bets/run 3→4" },
+    ],
+  },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
