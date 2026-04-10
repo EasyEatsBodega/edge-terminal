@@ -367,6 +367,7 @@ export default function App() {
   // Bot state — connects to VPS bot server
   const [botState, setBotState] = useState(null);
   const [botLoading, setBotLoading] = useState(false);
+  const [botError, setBotError] = useState(null);
   const [botSecret, setBotSecret] = useState(() => load("botSecret", "") || "edgeterminal2026");
   const [botSecretInput, setBotSecretInput] = useState(() => load("botSecret", "") || "edgeterminal2026");
   const [botUrl, setBotUrl] = useState(() => load("botUrl", "") || "http://142.93.228.49:3069");
@@ -392,12 +393,24 @@ export default function App() {
   const loadBotState = useCallback(async () => {
     if (!botSecret || !botUrl) return;
     setBotLoading(true);
+    setBotError(null);
     try {
-      const r = await fetch(buildBotUrl("state"));
-      if (!r.ok) throw new Error(`${r.status}`);
-      setBotState(await r.json());
-    } catch (e) { console.error("Bot state fetch failed:", e); }
-    finally { setBotLoading(false); }
+      const url = buildBotUrl("state");
+      const r = await fetch(url);
+      if (!r.ok) {
+        let detail = "";
+        try {
+          const body = await r.json();
+          detail = body?.detail || body?.error || "";
+        } catch {}
+        throw new Error(`HTTP ${r.status}${detail ? " — " + detail : ""}`);
+      }
+      const data = await r.json();
+      setBotState(data);
+    } catch (e) {
+      console.error("Bot state fetch failed:", e);
+      setBotError(e.message || String(e));
+    } finally { setBotLoading(false); }
   }, [botSecret, botUrl, buildBotUrl]);
 
   const triggerBotRun = useCallback(async () => {
@@ -1663,8 +1676,23 @@ export default function App() {
             })()}
 
             {!botState && (
-              <div style={{ padding: 40, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
-                Connect to the bot to see daily recaps. Go to the Bot view first.
+              <div style={{ padding: 30, background: PAL.panel, borderRadius: 10, border: `1px dashed ${botError ? PAL.red + "50" : PAL.border}` }}>
+                {botLoading ? (
+                  <div style={{ textAlign: "center", color: PAL.dim }}>Loading bot state...</div>
+                ) : botError ? (
+                  <>
+                    <div style={{ color: PAL.red, fontWeight: 700, fontSize: 13, marginBottom: 8 }}>⚠ Bot connection failed</div>
+                    <div style={{ color: PAL.sub, fontSize: 12, marginBottom: 12, fontFamily: "monospace", background: PAL.bg, padding: 10, borderRadius: 6 }}>{botError}</div>
+                    <div style={{ color: PAL.dim, fontSize: 11, lineHeight: 1.6 }}>
+                      Bot URL: <code>{botUrl}</code><br/>
+                      Via proxy: <code>/api/bot-proxy</code><br/>
+                      Check: (1) VPS bot is running, (2) port 3069 is open to all incoming, (3) bot secret matches
+                    </div>
+                    <button onClick={loadBotState} style={{ ...btnSm, marginTop: 12, color: PAL.blue, borderColor: `${PAL.blue}30` }}>Retry</button>
+                  </>
+                ) : (
+                  <div style={{ textAlign: "center", color: PAL.dim }}>Connect to the bot to see daily recaps. Go to the Bot view first.</div>
+                )}
               </div>
             )}
           </>)}
