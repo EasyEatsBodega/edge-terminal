@@ -1040,6 +1040,14 @@ async function runBot() {
       // Thesis: esports markets slightly underprice favorites (degen bettors love underdogs).
       if (CONFIRM_ENABLED && state.openPositions.length < MAX_POSITIONS) {
         let confirmBets = 0;
+        const confirmRejects = {
+          alreadyPositioned: 0,
+          lowLiq: 0,
+          dupEdgeBet: 0,
+          modelDisagrees: 0,  // our model is picking the OTHER team
+          belowMarketThreshold: 0,  // market prob < 65%
+          insufficientSize: 0,
+        };
 
         // Sort confirmation candidates by time (soonest first) so we prioritize
         // imminent action. allPredictions was already ordered by time from
@@ -1052,26 +1060,38 @@ async function runBot() {
         for (const ap of confirmCandidates) {
           if (confirmBets >= CONFIRM_MAX_PER_RUN) break;
           if (state.openPositions.length >= MAX_POSITIONS) break;
-          if (state.openPositions.some(p => p.matchId === ap.opp.match.id)) continue;
-          if ((ap.opp.polyOdds.liquidity || 0) < CONFIRM_MIN_LIQUIDITY) continue;
+          if (state.openPositions.some(p => p.matchId === ap.opp.match.id)) { confirmRejects.alreadyPositioned++; continue; }
+          if ((ap.opp.polyOdds.liquidity || 0) < CONFIRM_MIN_LIQUIDITY) { confirmRejects.lowLiq++; continue; }
 
           // Already placed an edge bet on this match?
-          if (betsPlaced.some(b => b.matchId === ap.opp.match.id)) continue;
+          if (betsPlaced.some(b => b.matchId === ap.opp.match.id)) { confirmRejects.dupEdgeBet++; continue; }
 
-          const { pred, pickSide, ourProb, marketProb } = ap;
+          // For confirmation bets, we need to pick the MARKET favorite, not our model's pick.
+          // The thesis is "ride the market consensus" — so we bet whichever side the market favors.
+          const marketFavSide = ap.opp.polyOdds.probA >= ap.opp.polyOdds.probB ? "A" : "B";
+          const marketFavProb = marketFavSide === "A" ? ap.opp.polyOdds.probA : ap.opp.polyOdds.probB;
+          const ourProbForFav = marketFavSide === "A" ? ap.pred.probA : ap.pred.probB;
 
-          // Both model and market must agree this is a heavy favorite
-          if (marketProb < CONFIRM_MIN_MARKET_PROB) continue;
-          if (ourProb < CONFIRM_MIN_OUR_PROB) continue;
-          if (pred.confidence === "low") continue;  // Need decent data
+          // Market must see a clear favorite (65%+)
+          if (marketFavProb < CONFIRM_MIN_MARKET_PROB) { confirmRejects.belowMarketThreshold++; continue; }
 
-          // Tiered sizing — stronger consensus = bigger position
-          const tier = CONFIRM_TIERS.find(t => marketProb >= t.minMarket && ourProb >= t.minModel) || CONFIRM_TIERS[CONFIRM_TIERS.length - 1];
+          // Our model must not STRONGLY disagree. We allow slight disagreement — we're
+          // trusting the market here, not our own model. But if our model thinks it's a
+          // coin flip or the other team's winning, skip it.
+          if (ourProbForFav < 50) { confirmRejects.modelDisagrees++; continue; }
+
+          // Tiered sizing — stronger consensus = bigger position.
+          // Tier is determined by MARKET probability primarily (since we're riding the market).
+          // Model threshold is relaxed — just "doesn't disagree".
+          const tier = CONFIRM_TIERS.find(t => marketFavProb >= t.minMarket) || CONFIRM_TIERS[CONFIRM_TIERS.length - 1];
           const confirmSize = Math.max(MIN_BET, Math.round(state.bankroll * tier.pct / 100));
           const currentDeployed = state.openPositions.reduce((s, p) => s + p.betSize, 0);
-          if (confirmSize > state.bankroll - currentDeployed) continue;
+          if (confirmSize > state.bankroll - currentDeployed) { confirmRejects.insufficientSize++; continue; }
 
           const opp = ap.opp;
+          const pickSide = marketFavSide;
+          const ourProb = ourProbForFav;
+          const marketProb = marketFavProb;
           const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
           const edge = ourProb - marketProb;
 
@@ -1125,6 +1145,15 @@ async function runBot() {
             `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>` +
             polyLink
           );
+        }
+
+        // Log confirmation bet rejections so we can see why nothing fires
+        const totalConfRejects = Object.values(confirmRejects).reduce((a, b) => a + b, 0);
+        if (totalConfRejects > 0) {
+          push(`   Confirm rejects: ${confirmRejects.belowMarketThreshold} below-65% · ${confirmRejects.modelDisagrees} model-disagrees · ${confirmRejects.lowLiq} low-liq · ${confirmRejects.alreadyPositioned} already-open · ${confirmRejects.dupEdgeBet} dup-edge-bet · ${confirmRejects.insufficientSize} no-room`);
+        }
+        if (confirmBets === 0 && allPredictions.length > 0) {
+          push(`   📭 No confirmation bets placed this run`);
         }
       }
     } else {
