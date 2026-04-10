@@ -10,6 +10,7 @@ import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
+import { getHltvRankDelta, rankDeltaToProbAdjust } from "./hltv.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "config.json");
@@ -240,7 +241,7 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
 
 // ─── Prediction Model (v3 — game scores, margins, dominance + recency) ─────
 
-function computePrediction(teamAId, teamBId, histA, histB, format, weights, game = null) {
+async function computePrediction(teamAId, teamBId, histA, histB, format, weights, game = null, teamAName = null, teamBName = null) {
   // Extract rich results — game scores, margins, not just W/L
   const getResults = (history, teamId) =>
     history.map(m => {
@@ -407,6 +408,21 @@ function computePrediction(teamAId, teamBId, histA, histB, format, weights, game
   // rustA/B range 0 to 0.15. If A is rusty, their predicted strength fades toward 50%.
   if (rustA > 0) prob = prob * (1 - rustA) + 50 * rustA;
   if (rustB > 0) prob = prob * (1 - rustB) + 50 * rustB;  // Rusty opponent = pull our edge back
+
+  // ─── HLTV Ranking Adjustment (CS2 only) ───────────────────────────────
+  // Our base model is 0-6 on CS2. HLTV rankings capture roster strength,
+  // map pool, and consistency that our W/L model doesn't see.
+  let hltvRankA = null, hltvRankB = null, hltvAdjust = 0;
+  if (game === "csgo" && teamAName && teamBName) {
+    try {
+      const delta = await getHltvRankDelta(teamAName, teamBName);
+      hltvAdjust = rankDeltaToProbAdjust(delta);
+      // Apply up to ±15% adjustment based on HLTV ranking gap
+      prob += hltvAdjust;
+    } catch (e) {
+      // HLTV unavailable — just skip the adjustment
+    }
+  }
 
   // BO format adjustment — game-specific volatility
   const bo = format || 1;
@@ -940,7 +956,7 @@ async function runBot() {
             pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t2.id}&per_page=25&sort=-scheduled_at`),
           ]);
 
-          const pred = computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights, opp.match._game);
+          const pred = await computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights, opp.match._game, opp.t1.name, opp.t2.name);
 
           const pickSide = pred.probA >= pred.probB ? "A" : "B";
           const ourProb = pickSide === "A" ? pred.probA : pred.probB;
