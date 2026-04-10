@@ -35,7 +35,7 @@ const CFG = loadConfig();
 const INITIAL_BANKROLL = 1000;
 const MAX_DEPLOYED_PCT = 35;         // Allow more deployment for volume
 const MAX_POSITIONS = 10;            // More concurrent positions for action
-const MIN_EDGE = 5;                  // Need real edge vs market, not 3% noise
+const MIN_EDGE = 3;                  // Lower threshold — catch more edges
 const MAX_EDGE = 25;                 // SANITY CHECK: edges >25% indicate wrong market matched
 const MAX_BET_PCT = 5;               // Smaller max bet — survival first
 const MIN_BET = 5;
@@ -46,7 +46,7 @@ const LIVE_ONLY_THRESHOLD_H = 0;     // Matches with hoursUntil < 0 are "live"
 const LIVE_MIN_MARKET_PROB = 75;     // Live bets: must still be 75%+ favorite
 const LIVE_SIZE_MULTIPLIER = 0.5;    // Live bets: half-size due to variance
 const MIN_LIQUIDITY = 1500;          // Lowered from $2k — esports markets can be thinner
-const MIN_OUR_PROB = 60;             // Keep — only bet confident picks
+const MIN_OUR_PROB = 55;             // Lowered — catch more confident picks
 const BETS_PER_RUN = 3;              // Up to 3 edge bets per run
 const PRICE_DISCOVERY_MIN = 55;      // Lowered from 58 — catch slight favorites
 
@@ -88,7 +88,7 @@ const GAME_TUNING = {
   csgo: {
     bo1Penalty: 0.30,    // CS2 BO1 is extremely volatile (pistol rounds, eco stacks)
     formWeight: 1.1,     // Recent form matters more in CS2 (map pool meta shifts)
-    minEdge: 6,          // Need bigger edge — CS2 markets are sharper
+    minEdge: 4,          // Lowered — CS2 markets are sharper but 6% was too strict
   },
   dota2: {
     bo1Penalty: 0.20,    // Dota BO1 less volatile than CS2 (draft matters more)
@@ -1104,7 +1104,7 @@ async function runBot() {
           // Game-specific minimum edge (CS2 markets are sharper, need bigger edge)
           const gameMinEdge = GAME_TUNING[opp.match._game]?.minEdge || MIN_EDGE;
           if (edge < gameMinEdge) { edgeRejects.lowEdge++; continue; }
-          if (pred.confidence === "low" && ourProb < 65) { edgeRejects.lowConfidence++; continue; }
+          if (pred.confidence === "low" && ourProb < 60) { edgeRejects.lowConfidence++; continue; }
 
           // SANITY CHECK: absurd edges mean the market matcher found the WRONG market.
           // A legitimate moneyline never has >25% mispricing. Reject and log.
@@ -1318,7 +1318,7 @@ async function runBot() {
             edge: +edge.toFixed(1),
             betSize: confirmSize,
             betPercent: +(confirmSize / state.bankroll * 100).toFixed(1),
-            confidence: pred.confidence,
+            confidence: ap.pred.confidence,
             betType: "confirmation",  // Tag it so we can track performance separately
             confirmTier: tier.label,
             isLive,
@@ -1327,9 +1327,9 @@ async function runBot() {
             format: opp.match.number_of_games || 1,
             placedAt: now.toISOString(),
             matchTime: opp.match.scheduled_at,
-            formA: pred.recordA,
-            formB: pred.recordB,
-            thesis: `CONFIRMATION BET: Model (${ourProb.toFixed(0)}%) and market (${marketProb.toFixed(0)}%) both agree — heavy favorite. ${pred.thesis || ""}`,
+            formA: ap.pred.recordA,
+            formB: ap.pred.recordB,
+            thesis: `CONFIRMATION BET: Model (${ourProb.toFixed(0)}%) and market (${marketProb.toFixed(0)}%) both agree — heavy favorite. ${ap.pred.thesis || ""}`,
             polyUrl: opp.polyOdds.polyUrl || null,
             polyLiquidity: opp.polyOdds.liquidity,
             matchStatus: "upcoming",
