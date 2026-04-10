@@ -206,6 +206,33 @@ async function fetchAllPolymarketEsports() {
   return deduped;
 }
 
+// How well does a candidate string match a target string?
+// Returns 0-100 score. Handles exact, prefix, suffix, substring matches.
+function nameMatchScore(target, candidate) {
+  if (!target || !candidate) return 0;
+  if (target === candidate) return 100;
+
+  // Normalize lengths for proportional scoring
+  const shorter = Math.min(target.length, candidate.length);
+  const longer = Math.max(target.length, candidate.length);
+  // Both must be at least 3 chars for fuzzy matches (avoid "te" matching "team")
+  if (shorter < 3) return 0;
+  // Shorter must be a meaningful fraction of longer (at least 30%)
+  if (shorter / longer < 0.30) return 0;
+
+  // Prefix match — "nova" is prefix of "novaesports". This is a very strong
+  // signal because teams are typically listed by their core brand name first.
+  if (candidate.startsWith(target) || target.startsWith(candidate)) return 85;
+
+  // Suffix match — less common but still strong
+  if (candidate.endsWith(target) || target.endsWith(candidate)) return 75;
+
+  // Substring match — one contains the other (not as prefix/suffix)
+  if (candidate.includes(target) || target.includes(candidate)) return 60;
+
+  return 0;
+}
+
 // Score how well a Polymarket market matches a given team pair.
 // Returns 0 if not a real match-winner market, higher scores for better matches.
 function scoreMarketMatch(mkt, teamA, teamB) {
@@ -214,58 +241,42 @@ function scoreMarketMatch(mkt, teamA, teamB) {
   const b = norm(teamB);
   if (!a || !b || a.length < 2 || b.length < 2) return 0;
 
-  const question = norm(mkt.question || "");
   const rawOutcomes = typeof mkt.outcomes === "string" ? JSON.parse(mkt.outcomes) : (mkt.outcomes || []);
   const outcomes = rawOutcomes.map(o => norm(String(o)));
 
-  // Reject markets that aren't "Team A vs Team B" style moneylines
+  // Reject markets that aren't "Team A vs Team B" style moneylines.
   // Look for disqualifying keywords in the question — these indicate prop/specialty markets.
   const rawQ = (mkt.question || "").toLowerCase();
-  const badKeywords = ["map ", "2-0", "2-1", "3-0", "3-1", "3-2", "total maps", "will any", "any map", "first blood", "first kill", "first to", "number of maps", "correct score", "exact score", "over under", "over/under", "parlay"];
+  const badKeywords = ["2-0", "2-1", "3-0", "3-1", "3-2", "total maps", "will any", "any map", "first blood", "first kill", "first to", "number of maps", "correct score", "exact score", "over under", "over/under", "parlay"];
   if (badKeywords.some(kw => rawQ.includes(kw))) return 0;
-
-  // Require a "vs" or "versus" in the question for match-winner markets
-  if (!rawQ.includes("vs") && !rawQ.includes("versus")) return 0;
+  // "map " is a specific disqualifier — but be careful not to match "mapping" etc.
+  if (/\bmap\s/.test(rawQ) && !/vs.*?in\b/.test(rawQ)) return 0;
 
   // Must have exactly 2 outcomes for a head-to-head moneyline
   if (outcomes.length !== 2) return 0;
 
-  // Scoring system — we want EXACT or near-exact team name matches
-  let score = 0;
+  // Score each team against each outcome, take the best
+  const scoreA0 = nameMatchScore(a, outcomes[0]);
+  const scoreA1 = nameMatchScore(a, outcomes[1]);
+  const scoreB0 = nameMatchScore(b, outcomes[0]);
+  const scoreB1 = nameMatchScore(b, outcomes[1]);
 
-  // Exact match to an outcome = best
-  const aExact = outcomes.some(o => o === a);
-  const bExact = outcomes.some(o => o === b);
-  if (aExact) score += 100;
-  if (bExact) score += 100;
+  // Best pairing: A matches one outcome, B matches the other
+  const pairing1 = scoreA0 + scoreB1; // A=outcome0, B=outcome1
+  const pairing2 = scoreA1 + scoreB0; // A=outcome1, B=outcome0
+  const bestPairing = Math.max(pairing1, pairing2);
 
-  // Outcome contains team name or vice versa (weaker)
-  // But require minimum 3-char overlap to avoid "TE" matching "team"
-  if (!aExact) {
-    const aMatch = outcomes.find(o => (o.length >= 3 && a.length >= 3) && (o.includes(a) || a.includes(o)));
-    if (aMatch) {
-      // Prefer matches where one is a prefix/suffix of the other (stronger match)
-      const overlap = Math.min(aMatch.length, a.length);
-      const longer = Math.max(aMatch.length, a.length);
-      score += Math.round((overlap / longer) * 50);
-    }
-  }
-  if (!bExact) {
-    const bMatch = outcomes.find(o => (o.length >= 3 && b.length >= 3) && (o.includes(b) || b.includes(o)));
-    if (bMatch) {
-      const overlap = Math.min(bMatch.length, b.length);
-      const longer = Math.max(bMatch.length, b.length);
-      score += Math.round((overlap / longer) * 50);
-    }
-  }
+  // Require a minimum combined score — both teams must have some match
+  // 100 = one exact + unmatched OR two decent partials (50+50)
+  // Lowered from previous strict requirement so prefix matches work
+  if (bestPairing < 100) return 0;
 
-  // Question text also mentions both teams — bonus
-  if (question.includes(a) && question.includes(b)) score += 20;
+  // Need BOTH teams to match at least partially (not just one team scoring 100)
+  const aBestScore = Math.max(scoreA0, scoreA1);
+  const bBestScore = Math.max(scoreB0, scoreB1);
+  if (aBestScore < 50 || bBestScore < 50) return 0;
 
-  // BOTH teams must be matched somehow for this to count
-  if (score < 50) return 0;  // At minimum one exact match OR two strong partials
-
-  return score;
+  return bestPairing;
 }
 
 function matchPolymarket(polyMarkets, teamA, teamB) {
@@ -275,9 +286,8 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
   if (!a || !b) return null;
 
   // Score every market and pick the best-matching one.
-  // Must have a score >= 100 (at least one exact match).
   let best = null;
-  let bestScore = 99; // require > 99 to avoid returning partial/ambiguous matches
+  let bestScore = 99; // require > 99 (minimum from scoreMarketMatch)
 
   for (const mkt of polyMarkets) {
     if (!mkt.outcomePrices) continue;
@@ -295,12 +305,9 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
   const prices = typeof best.outcomePrices === "string" ? JSON.parse(best.outcomePrices) : best.outcomePrices;
   if (prices.length < 2) return null;
 
-  // Figure out which outcome is team A based on direct match
-  const o0 = outcomes[0] || "";
-  const o1 = outcomes[1] || "";
-  // Score each outcome's match to team A
-  const aScore0 = o0 === a ? 2 : (o0.includes(a) || a.includes(o0)) ? 1 : 0;
-  const aScore1 = o1 === a ? 2 : (o1.includes(a) || a.includes(o1)) ? 1 : 0;
+  // Figure out which outcome is team A based on best match score
+  const aScore0 = nameMatchScore(a, outcomes[0] || "");
+  const aScore1 = nameMatchScore(a, outcomes[1] || "");
   const aIsFirst = aScore0 >= aScore1;
 
   const probFirst = parseFloat(prices[0]) * 100;
