@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
 import { getHltvRankDelta, rankDeltaToProbAdjust } from "./hltv.mjs";
+import { checkMatchRosters } from "./liquipedia.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "config.json");
@@ -957,6 +958,14 @@ async function runBot() {
           ]);
 
           const pred = await computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights, opp.match._game, opp.t1.name, opp.t2.name);
+
+          // Check for recent roster changes (Liquipedia) — skip if either team
+          // changed a player in the last 7 days (stand-ins wreck historical form)
+          const rosterCheck = await checkMatchRosters(opp.t1.name, opp.t2.name, opp.match._game);
+          if (rosterCheck.skip) {
+            push(`⚠️ Skipping ${opp.t1.name} vs ${opp.t2.name}: ${rosterCheck.reason}`);
+            continue;
+          }
 
           const pickSide = pred.probA >= pred.probB ? "A" : "B";
           const ourProb = pickSide === "A" ? pred.probA : pred.probB;
