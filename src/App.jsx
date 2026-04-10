@@ -12,9 +12,9 @@ const PAL = {
   green: "#22c55e", red: "#ef4444", yellow: "#eab308", blue: "#3b82f6",
   purple: "#a855f7", orange: "#f97316",
 };
-const GAME_COLOR = { csgo: "#f97316", dota2: "#ef4444", lol: "#3b82f6" };
-const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
-const GAME_SLUG = { csgo: "csgo", dota2: "dota2", lol: "lol" };
+const GAME_COLOR = { csgo: "#f97316", dota2: "#ef4444", lol: "#3b82f6", valorant: "#a855f7" };
+const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant" };
+const GAME_SLUG = { csgo: "csgo", dota2: "dota2", lol: "lol", valorant: "valorant" };
 
 const save = (k, v) => { try { localStorage.setItem(`et2_${k}`, JSON.stringify(v)); } catch(e){} };
 const load = (k, fb) => { try { const v = localStorage.getItem(`et2_${k}`); return v ? JSON.parse(v) : fb; } catch(e){ return fb; } };

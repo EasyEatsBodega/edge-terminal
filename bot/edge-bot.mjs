@@ -63,7 +63,7 @@ const CONFIRM_TIERS = [
 ];
 
 // ─── Game-Specific Adjustments ─────────────────────────────────────────────
-// CS2, Dota 2, and LoL play very differently. One model doesn't fit all.
+// Each game plays very differently. One model doesn't fit all.
 const GAME_TUNING = {
   csgo: {
     bo1Penalty: 0.30,    // CS2 BO1 is extremely volatile (pistol rounds, eco stacks)
@@ -78,6 +78,11 @@ const GAME_TUNING = {
   lol: {
     bo1Penalty: 0.22,    // LoL BO1 moderate volatility
     formWeight: 1.0,     // Standard form weight
+    minEdge: 5,          // Standard edge threshold
+  },
+  valorant: {
+    bo1Penalty: 0.28,    // Valorant BO1 is volatile (agent picks, map bans matter)
+    formWeight: 1.0,     // Standard
     minEdge: 5,          // Standard edge threshold
   },
 };
@@ -134,7 +139,10 @@ async function pandaFetch(path) {
 
 // ─── Polymarket ─────────────────────────────────────────────────────────────
 
-const POLY_TAG = { csgo: 100780, dota2: 102366, lol: 65 };
+// Tag IDs for esports games on Polymarket. Valorant ID might need adjustment
+// — if Valorant matches aren't being found, Polymarket's actual tag ID differs.
+// The fetchAllPolymarketEsports also does a general esports sweep as fallback.
+const POLY_TAG = { csgo: 100780, dota2: 102366, lol: 65, valorant: 102370 };
 
 async function fetchPolymarketByGame(game) {
   const tagId = POLY_TAG[game];
@@ -146,13 +154,36 @@ async function fetchPolymarketByGame(game) {
   } catch { return []; }
 }
 
+// Fallback: fetch all active moneyline sports markets with no tag filter.
+// This catches Valorant (and any other esports) markets we might miss if
+// our tag IDs are wrong or if Polymarket adds new categories.
+async function fetchAllPolymarketMoneyline() {
+  try {
+    const r = await fetch(`https://gamma-api.polymarket.com/markets?sports_market_types=moneyline&closed=false&limit=200`);
+    if (!r.ok) return [];
+    return await r.json();
+  } catch { return []; }
+}
+
 async function fetchAllPolymarketEsports() {
-  const [csgo, dota2, lol] = await Promise.all([
+  const [csgo, dota2, lol, valorant, general] = await Promise.all([
     fetchPolymarketByGame("csgo"),
     fetchPolymarketByGame("dota2"),
     fetchPolymarketByGame("lol"),
+    fetchPolymarketByGame("valorant"),
+    fetchAllPolymarketMoneyline(),
   ]);
-  return [...csgo, ...dota2, ...lol];
+  // Dedupe by market id/slug — the general fetch overlaps with game-specific ones
+  const seen = new Set();
+  const all = [...csgo, ...dota2, ...lol, ...valorant, ...general];
+  const deduped = [];
+  for (const mkt of all) {
+    const key = mkt.id || mkt.conditionId || mkt.slug || JSON.stringify(mkt.outcomes);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(mkt);
+  }
+  return deduped;
 }
 
 function matchPolymarket(polyMarkets, teamA, teamB) {
@@ -797,10 +828,11 @@ async function runBot() {
     const canBet = state.openPositions.length < MAX_POSITIONS && deployedPct < MAX_DEPLOYED_PCT && state.bankroll > MIN_BET;
 
     if (canBet) {
-      const [csgo, dota2, lol, polyMarkets] = await Promise.all([
+      const [csgo, dota2, lol, valorant, polyMarkets] = await Promise.all([
         pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("valorant/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
       ]);
 
@@ -808,6 +840,7 @@ async function runBot() {
         ...csgo.map(m => ({ ...m, _game: "csgo" })),
         ...dota2.map(m => ({ ...m, _game: "dota2" })),
         ...lol.map(m => ({ ...m, _game: "lol" })),
+        ...valorant.map(m => ({ ...m, _game: "valorant" })),
       ];
 
       push(`📊 Found ${allMatches.length} upcoming matches, ${polyMarkets.length} Polymarket moneyline markets`);
@@ -1292,7 +1325,7 @@ const server = createServer(async (req, res) => {
 // TELEGRAM COMMAND LISTENER — /trades, /status, /run
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant" };
 
 async function handleTelegramCommand(text) {
   const state = loadState();
@@ -1566,19 +1599,21 @@ async function handleTelegramCommand(text) {
     // Does NOT place any bets.
     try {
       const now = new Date();
-      const [csgo, dota2, lol, polyMarkets] = await Promise.all([
+      const [csgo, dota2, lol, valorant, polyMarkets] = await Promise.all([
         pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("valorant/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
       ]);
       const allMatches = [
         ...csgo.map(m => ({ ...m, _game: "csgo" })),
         ...dota2.map(m => ({ ...m, _game: "dota2" })),
         ...lol.map(m => ({ ...m, _game: "lol" })),
+        ...valorant.map(m => ({ ...m, _game: "valorant" })),
       ];
 
-      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant" };
       const inWindow = [];
       for (const m of allMatches) {
         const t1 = m.opponents?.[0]?.opponent;
