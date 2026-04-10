@@ -1275,35 +1275,36 @@ export default function App() {
                       <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>MKT</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span style={{ textAlign: "right" }}>DATE</span><span></span>
                     </div>
                     {closed.map(p => (
-                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 70px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
-                        <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
-                        <div>
-                          <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
-                            {p.pick}
-                            <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: p.result === "win" ? `${PAL.green}20` : `${PAL.red}20`, color: p.result === "win" ? PAL.green : PAL.red }}>{p.result?.toUpperCase()}</span>
+                      <div key={p.id}>
+                        <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 70px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
+                          <div>
+                            <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+                              {p.pick}
+                              <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: p.result === "win" ? `${PAL.green}20` : `${PAL.red}20`, color: p.result === "win" ? PAL.green : PAL.red }}>{p.result?.toUpperCase()}</span>
+                            </div>
+                            <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{p.league ? ` · ${p.league}` : ""}{p.format > 1 ? ` · BO${p.format}` : ""}</div>
                           </div>
-                          <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{p.league ? ` · ${p.league}` : ""}{p.format > 1 ? ` · BO${p.format}` : ""}</div>
+                          <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600 }}>{p.ourProb}%</div>
+                          <div style={{ textAlign: "center", fontSize: 12, color: PAL.sub }}>{p.marketProb}%</div>
+                          <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600, color: PAL.green }}>+{p.edge}%</div>
+                          <div style={{ textAlign: "center", fontSize: 12 }}>${p.betSize}</div>
+                          <div style={{ textAlign: "center", fontWeight: 700, color: (p.pnl || 0) >= 0 ? PAL.green : PAL.red }}>
+                            {(p.pnl || 0) >= 0 ? "+" : ""}${(p.pnl || 0).toFixed(2)}
+                          </div>
+                          <div style={{ fontSize: 10, color: PAL.dim, textAlign: "right" }}>
+                            {p.resolvedAt ? new Date(p.resolvedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : p.placedAt ? new Date(p.placedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : ""}
+                          </div>
+                          <div style={{ textAlign: "center" }}>
+                            {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
+                          </div>
                         </div>
-                        <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600 }}>{p.ourProb}%</div>
-                        <div style={{ textAlign: "center", fontSize: 12, color: PAL.sub }}>{p.marketProb}%</div>
-                        <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600, color: PAL.green }}>+{p.edge}%</div>
-                        <div style={{ textAlign: "center", fontSize: 12 }}>${p.betSize}</div>
-                        <div style={{ textAlign: "center", fontWeight: 700, color: (p.pnl || 0) >= 0 ? PAL.green : PAL.red }}>
-                          {(p.pnl || 0) >= 0 ? "+" : ""}${(p.pnl || 0).toFixed(2)}
-                        </div>
-                        <div style={{ fontSize: 10, color: PAL.dim, textAlign: "right" }}>
-                          {p.resolvedAt ? new Date(p.resolvedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : p.placedAt ? new Date(p.placedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : ""}
-                        </div>
-                        <div style={{ textAlign: "center" }}>
-                          {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
-                        </div>
+                        {p.lossReason && (
+                          <div style={{ padding: "4px 14px 6px", fontSize: 10, color: PAL.red, fontStyle: "italic", background: `${PAL.red}05`, borderRadius: "0 0 6px 6px", marginTop: -2 }}>
+                            Loss reason: {p.lossReason}
+                          </div>
+                        )}
                       </div>
-                      {p.lossReason && (
-                        <div style={{ gridColumn: "1 / -1", padding: "4px 14px 6px", fontSize: 10, color: PAL.red, fontStyle: "italic", background: `${PAL.red}05`, borderRadius: "0 0 6px 6px", marginTop: -2 }}>
-                          Loss reason: {p.lossReason}
-                        </div>
-                      )}
-                    </div>
                     ))}
                   </div>
                 )}
