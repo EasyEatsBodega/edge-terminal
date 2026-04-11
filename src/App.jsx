@@ -373,6 +373,7 @@ export default function App() {
   const [botUrl, setBotUrl] = useState(() => load("botUrl", "") || "http://142.93.228.49:3069");
   const [botUrlInput, setBotUrlInput] = useState(() => load("botUrl", "") || "http://142.93.228.49:3069");
   const [botRunning, setBotRunning] = useState(false);
+  const [botHistoryDayIdx, setBotHistoryDayIdx] = useState(0); // 0 = most recent day
 
   // Helper: build a request URL. On HTTPS (production) we MUST proxy through
   // /api/bot-proxy because browsers block HTTPS→HTTP mixed content. On HTTP
@@ -1281,64 +1282,141 @@ export default function App() {
                 )}
               </div>
 
-              {/* Trade History */}
-              <div>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700 }}>Trade History ({closed.length})</div>
-                  {closed.length > 0 && (
-                    <div style={{ fontSize: 11, color: PAL.dim }}>
-                      Total P&L:{" "}
-                      <span style={{ fontWeight: 700, color: totalPnl >= 0 ? PAL.green : PAL.red }}>
-                        {totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)}
-                      </span>
-                    </div>
-                  )}
-                </div>
-                {closed.length === 0 ? (
-                  <div style={{ padding: 24, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
-                    No resolved bets yet. The bot will auto-resolve when matches finish.
+              {/* Trade History — Day by Day */}
+              {(() => {
+                // Group closed trades by resolved date
+                const dayMap = {};
+                closed.forEach(p => {
+                  const d = (p.resolvedAt || p.placedAt || "").slice(0, 10);
+                  if (!d) return;
+                  if (!dayMap[d]) dayMap[d] = [];
+                  dayMap[d].push(p);
+                });
+                const sortedDays = Object.keys(dayMap).sort((a, b) => b.localeCompare(a)); // newest first
+                const clampedIdx = Math.max(0, Math.min(botHistoryDayIdx, sortedDays.length - 1));
+                const selectedDate = sortedDays[clampedIdx];
+                const dayTrades = selectedDate ? dayMap[selectedDate] : [];
+                const dayWins = dayTrades.filter(p => p.result === "win").length;
+                const dayLosses = dayTrades.filter(p => p.result === "loss").length;
+                const dayPnl = dayTrades.reduce((s, p) => s + (p.pnl || 0), 0);
+                const today = new Date().toISOString().slice(0, 10);
+
+                const formatDayLabel = (dateStr) => {
+                  if (!dateStr) return "";
+                  if (dateStr === today) return "Today";
+                  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+                  if (dateStr === yesterday) return "Yesterday";
+                  return new Date(dateStr + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+                };
+
+                return (
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700 }}>Trade History ({closed.length} total)</div>
+                    {closed.length > 0 && (
+                      <div style={{ fontSize: 11, color: PAL.dim }}>
+                        All-time P&L:{" "}
+                        <span style={{ fontWeight: 700, color: totalPnl >= 0 ? PAL.green : PAL.red }}>
+                          {totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)}
+                        </span>
+                      </div>
+                    )}
                   </div>
-                ) : (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                    {/* Header row */}
-                    <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 70px 32px", padding: "6px 14px", fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.05em" }}>
-                      <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>MKT</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span style={{ textAlign: "right" }}>DATE</span><span></span>
+
+                  {sortedDays.length === 0 ? (
+                    <div style={{ padding: 24, background: PAL.panel, borderRadius: 10, textAlign: "center", color: PAL.dim, border: `1px dashed ${PAL.border}` }}>
+                      No resolved bets yet. The bot will auto-resolve when matches finish.
                     </div>
-                    {closed.map(p => (
-                      <div key={p.id}>
-                        <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 70px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
-                          <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
-                          <div>
-                            <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
-                              {p.pick}
-                              <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: p.result === "win" ? `${PAL.green}20` : `${PAL.red}20`, color: p.result === "win" ? PAL.green : PAL.red }}>{p.result?.toUpperCase()}</span>
-                            </div>
-                            <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{p.league ? ` · ${p.league}` : ""}{p.format > 1 ? ` · BO${p.format}` : ""}</div>
-                          </div>
-                          <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600 }}>{p.ourProb}%</div>
-                          <div style={{ textAlign: "center", fontSize: 12, color: PAL.sub }}>{p.marketProb}%</div>
-                          <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600, color: PAL.green }}>+{p.edge}%</div>
-                          <div style={{ textAlign: "center", fontSize: 12 }}>${p.betSize}</div>
-                          <div style={{ textAlign: "center", fontWeight: 700, color: (p.pnl || 0) >= 0 ? PAL.green : PAL.red }}>
-                            {(p.pnl || 0) >= 0 ? "+" : ""}${(p.pnl || 0).toFixed(2)}
-                          </div>
-                          <div style={{ fontSize: 10, color: PAL.dim, textAlign: "right" }}>
-                            {p.resolvedAt ? new Date(p.resolvedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : p.placedAt ? new Date(p.placedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : ""}
-                          </div>
-                          <div style={{ textAlign: "center" }}>
-                            {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
+                  ) : (
+                    <>
+                      {/* Day Navigator */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: PAL.panel, borderRadius: 10, padding: "10px 16px", border: `1px solid ${PAL.border}`, marginBottom: 10 }}>
+                        <button
+                          onClick={() => setBotHistoryDayIdx(Math.min(clampedIdx + 1, sortedDays.length - 1))}
+                          disabled={clampedIdx >= sortedDays.length - 1}
+                          style={{ background: "none", border: `1px solid ${PAL.border}`, borderRadius: 6, padding: "4px 10px", color: clampedIdx >= sortedDays.length - 1 ? PAL.dim : PAL.text, cursor: clampedIdx >= sortedDays.length - 1 ? "default" : "pointer", fontSize: 12, fontFamily: "inherit" }}
+                        >
+                          ← Older
+                        </button>
+                        <div style={{ textAlign: "center" }}>
+                          <div style={{ fontSize: 14, fontWeight: 700 }}>{formatDayLabel(selectedDate)}</div>
+                          <div style={{ fontSize: 11, color: PAL.dim }}>{selectedDate} · Day {sortedDays.length - clampedIdx} of {sortedDays.length}</div>
+                        </div>
+                        <button
+                          onClick={() => setBotHistoryDayIdx(Math.max(clampedIdx - 1, 0))}
+                          disabled={clampedIdx <= 0}
+                          style={{ background: "none", border: `1px solid ${PAL.border}`, borderRadius: 6, padding: "4px 10px", color: clampedIdx <= 0 ? PAL.dim : PAL.text, cursor: clampedIdx <= 0 ? "default" : "pointer", fontSize: 12, fontFamily: "inherit" }}
+                        >
+                          Newer →
+                        </button>
+                      </div>
+
+                      {/* Day Stats */}
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 10 }}>
+                        <div style={{ background: PAL.card, borderRadius: 8, padding: "10px 14px", border: `1px solid ${PAL.border}` }}>
+                          <div style={{ fontSize: 10, color: PAL.dim, marginBottom: 2 }}>Day P&L</div>
+                          <div style={{ fontSize: 20, fontWeight: 800, color: dayPnl >= 0 ? PAL.green : PAL.red }}>
+                            {dayPnl >= 0 ? "+" : ""}${dayPnl.toFixed(2)}
                           </div>
                         </div>
-                        {p.lossReason && (
-                          <div style={{ padding: "4px 14px 6px", fontSize: 10, color: PAL.red, fontStyle: "italic", background: `${PAL.red}05`, borderRadius: "0 0 6px 6px", marginTop: -2 }}>
-                            Loss reason: {p.lossReason}
+                        <div style={{ background: PAL.card, borderRadius: 8, padding: "10px 14px", border: `1px solid ${PAL.border}` }}>
+                          <div style={{ fontSize: 10, color: PAL.dim, marginBottom: 2 }}>Record</div>
+                          <div style={{ fontSize: 20, fontWeight: 800 }}>{dayWins}W - {dayLosses}L</div>
+                        </div>
+                        <div style={{ background: PAL.card, borderRadius: 8, padding: "10px 14px", border: `1px solid ${PAL.border}` }}>
+                          <div style={{ fontSize: 10, color: PAL.dim, marginBottom: 2 }}>Hit Rate</div>
+                          <div style={{ fontSize: 20, fontWeight: 800, color: (dayWins + dayLosses) > 0 && (dayWins / (dayWins + dayLosses) * 100) >= 50 ? PAL.green : PAL.red }}>
+                            {(dayWins + dayLosses) > 0 ? (dayWins / (dayWins + dayLosses) * 100).toFixed(0) : 0}%
                           </div>
-                        )}
+                        </div>
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+
+                      {/* Day Trades */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                        {/* Header row */}
+                        <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 32px", padding: "6px 14px", fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.05em" }}>
+                          <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>MKT</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span></span>
+                        </div>
+                        {dayTrades.map(p => (
+                          <div key={p.id}>
+                            <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
+                              <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
+                              <div>
+                                <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+                                  {p.pick}
+                                  <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: p.result === "win" ? `${PAL.green}20` : `${PAL.red}20`, color: p.result === "win" ? PAL.green : PAL.red }}>{p.result?.toUpperCase()}</span>
+                                </div>
+                                <div style={{ fontSize: 11, color: PAL.dim }}>{p.event}{p.league ? ` · ${p.league}` : ""}{p.format > 1 ? ` · BO${p.format}` : ""}</div>
+                              </div>
+                              <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600 }}>{p.ourProb}%</div>
+                              <div style={{ textAlign: "center", fontSize: 12, color: PAL.sub }}>{p.marketProb}%</div>
+                              <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600, color: PAL.green }}>+{p.edge}%</div>
+                              <div style={{ textAlign: "center", fontSize: 12 }}>${p.betSize}</div>
+                              <div style={{ textAlign: "center", fontWeight: 700, color: (p.pnl || 0) >= 0 ? PAL.green : PAL.red }}>
+                                {(p.pnl || 0) >= 0 ? "+" : ""}${(p.pnl || 0).toFixed(2)}
+                              </div>
+                              <div style={{ textAlign: "center" }}>
+                                {p.polyUrl && <a href={p.polyUrl} target="_blank" rel="noopener noreferrer" style={{ color: PAL.blue, fontSize: 11, textDecoration: "none" }} title="View on Polymarket">PM</a>}
+                              </div>
+                            </div>
+                            {p.thesis && (
+                              <div style={{ padding: "6px 14px 8px", background: PAL.card, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, borderRadius: "0 0 8px 8px", fontSize: 11, color: PAL.dim, fontStyle: "italic" }}>
+                                {p.thesis}
+                              </div>
+                            )}
+                            {p.lossReason && (
+                              <div style={{ padding: "4px 14px 6px", fontSize: 10, color: PAL.red, fontStyle: "italic", background: `${PAL.red}05`, borderRadius: "0 0 6px 6px", marginTop: -2 }}>
+                                Loss reason: {p.lossReason}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+                );
+              })()}
 
               {/* Last Run Info */}
               {botState.lastRunAt && (
