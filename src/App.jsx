@@ -1537,8 +1537,7 @@ export default function App() {
                   const dayDate = new Date(day.date + "T12:00:00Z");
                   const dateLabel = dayDate.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
                   const isToday = day.date === new Date().toISOString().slice(0, 10);
-                  const isYesterday = day.date === new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-                  const dayLabel = isToday ? "Today" : isYesterday ? "Yesterday" : dateLabel;
+                  const dayLabel = dateLabel;
 
                   const dayResolved = day.resolved;
                   const dayPlaced = day.placed;
@@ -1637,8 +1636,7 @@ export default function App() {
                             {isToday && <span style={{ fontSize: 10, fontWeight: 600, color: PAL.purple, background: `${PAL.purple}20`, padding: "2px 8px", borderRadius: 4 }}>LIVE</span>}
                           </div>
                           <div style={{ fontSize: 12, color: PAL.dim, marginTop: 2 }}>
-                            {!isToday && !isYesterday && dateLabel}
-                            {gamesActive.length > 0 && <> · {gamesActive.map(g => GAME_LABEL[g] || g).join(", ")}</>}
+                            {gamesActive.length > 0 && gamesActive.map(g => GAME_LABEL[g] || g).join(", ")}
                           </div>
                         </div>
                         <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
