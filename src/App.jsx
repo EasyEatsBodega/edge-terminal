@@ -374,6 +374,8 @@ export default function App() {
   const [botUrlInput, setBotUrlInput] = useState(() => load("botUrl", "") || "http://142.93.228.49:3069");
   const [botRunning, setBotRunning] = useState(false);
   const [botHistoryDayIdx, setBotHistoryDayIdx] = useState(0); // 0 = most recent day
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => load("sidebarCollapsed", false));
+  useEffect(() => { save("sidebarCollapsed", sidebarCollapsed); }, [sidebarCollapsed]);
 
   // Helper: build a request URL. On HTTPS (production) we MUST proxy through
   // /api/bot-proxy because browsers block HTTPS→HTTP mixed content. On HTTP
@@ -636,14 +638,32 @@ export default function App() {
 
       {/* ═══════════ SIDEBAR ═══════════ */}
       <div style={{
-        width: 200, flexShrink: 0, background: PAL.panel, borderRight: `1px solid ${PAL.border}`,
+        width: sidebarCollapsed ? 44 : 200, flexShrink: 0, background: PAL.panel, borderRight: `1px solid ${PAL.border}`,
         display: "flex", flexDirection: "column", position: "sticky", top: 0, height: "100vh",
+        transition: "width 0.15s ease",
       }}>
-        <div style={{ padding: "16px 14px", borderBottom: `1px solid ${PAL.border}` }}>
-          <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: "-0.03em" }}>EDGE</div>
-          <div style={{ fontSize: 10, color: PAL.dim, letterSpacing: "0.1em" }}>TERMINAL v2</div>
+        <div style={{ padding: sidebarCollapsed ? "12px 6px" : "16px 14px", borderBottom: `1px solid ${PAL.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
+          {!sidebarCollapsed && (
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: "-0.03em" }}>EDGE</div>
+              <div style={{ fontSize: 10, color: PAL.dim, letterSpacing: "0.1em" }}>TERMINAL v2</div>
+            </div>
+          )}
+          <button
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            style={{
+              width: 28, height: 28, borderRadius: 6, border: `1px solid ${PAL.border}`,
+              background: PAL.card, color: PAL.sub, cursor: "pointer", fontSize: 14,
+              fontFamily: "inherit", display: "flex", alignItems: "center", justifyContent: "center",
+              flexShrink: 0,
+            }}
+          >
+            {sidebarCollapsed ? "›" : "‹"}
+          </button>
         </div>
 
+        {sidebarCollapsed ? null : (<>
         {/* Game Filter */}
         <div style={{ padding: "10px 8px", borderBottom: `1px solid ${PAL.border}` }}>
           <div style={{ fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.1em", padding: "0 8px", marginBottom: 6 }}>GAMES</div>
@@ -703,6 +723,7 @@ export default function App() {
             {clock.toLocaleTimeString()}
           </div>
         </div>
+        </>)}
       </div>
 
       {/* ═══════════ MAIN ═══════════ */}
