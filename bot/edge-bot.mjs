@@ -1641,7 +1641,7 @@ async function handleTelegramCommand(text) {
     for (let i = 0; i < open.length; i++) {
       const p = open[i];
       const game = GAME_LABEL[p.game] || p.game;
-      const matchDate = new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
+      const matchDate = new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: true }) + " ET";
       const link = p.polyUrl || `https://polymarket.com/markets/esports`;
 
       // Get live Polymarket price for this position
@@ -1670,7 +1670,7 @@ async function handleTelegramCommand(text) {
       msg += `\n`;
       msg += `   Model: ${p.ourProb}% | Edge: +${p.edge}%\n`;
       if (livePnlStr) msg += `   Live P&L: <b>${livePnlStr}</b>\n`;
-      msg += `   ${p.league} · BO${p.format} · ${matchDate} UTC\n`;
+      msg += `   ${p.league} · BO${p.format} · 📅 ${matchDate}\n`;
       if (p.polyLiquidity) msg += `   💧 Liquidity: $${p.polyLiquidity.toFixed(0)}\n`;
       if (p.thesis) msg += `   📝 <i>${p.thesis}</i>\n`;
       msg += `   🔗 <a href="${link}">View on Polymarket</a>\n\n`;
@@ -1878,8 +1878,10 @@ async function handleTelegramCommand(text) {
       sortedOpen.forEach(p => {
         const typeTag = p.betType === "confirmation" ? " [C]" : p.betType === "fade" ? " [F]" : " [E]";
         const matchStr = p.matchTime ? new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: true }) + " ET" : "?";
-        msg += `   🎯${typeTag} ${p.pick} (${p.event})\n`;
-        msg += `      📅 Match: ${matchStr} | $${p.size?.toFixed(2) || "?"}\n`;
+        const statusEmoji = p.matchStatus === "live" ? "🔴" : "⏰";
+        const game = GAME_LABEL[p.game] || p.game || "";
+        msg += `   ${statusEmoji}${typeTag} <b>${p.pick}</b> — ${game} · ${p.event}\n`;
+        msg += `      📅 ${matchStr} | $${(p.betSize || p.size || 0).toFixed(2)} @ ${p.marketProb}% | Edge: +${p.edge}%\n`;
       });
       msg += "\n";
     }
