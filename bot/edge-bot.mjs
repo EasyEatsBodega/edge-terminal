@@ -1871,6 +1871,19 @@ async function handleTelegramCommand(text) {
       msg += "\n";
     }
 
+    // Open positions with match times
+    if (open.length > 0) {
+      msg += `⏳ <b>OPEN POSITIONS (${open.length})</b>\n`;
+      const sortedOpen = [...open].sort((a, b) => new Date(a.matchTime) - new Date(b.matchTime));
+      sortedOpen.forEach(p => {
+        const typeTag = p.betType === "confirmation" ? " [C]" : p.betType === "fade" ? " [F]" : " [E]";
+        const matchStr = p.matchTime ? new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: true }) + " ET" : "?";
+        msg += `   🎯${typeTag} ${p.pick} (${p.event})\n`;
+        msg += `      📅 Match: ${matchStr} | $${p.size?.toFixed(2) || "?"}\n`;
+      });
+      msg += "\n";
+    }
+
     // Recent trades
     const recent5 = closed.slice(0, 5);
     if (recent5.length > 0) {
@@ -1878,7 +1891,10 @@ async function handleTelegramCommand(text) {
       recent5.forEach(p => {
         const emoji = p.result === "win" ? "✅" : "❌";
         const typeTag = p.betType === "confirmation" ? " [C]" : " [E]";
+        const placedStr = p.placedAt ? new Date(p.placedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: true }) + " ET" : "?";
+        const matchStr = p.matchTime ? new Date(p.matchTime).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: true }) + " ET" : "?";
         msg += `   ${emoji}${typeTag} ${p.pick} (${p.event}) ${p.pnl >= 0 ? "+" : ""}$${p.pnl.toFixed(2)}\n`;
+        msg += `      Bet: ${placedStr} | Match: ${matchStr}\n`;
       });
     }
 
