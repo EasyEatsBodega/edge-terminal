@@ -629,7 +629,9 @@ function buildThesis(rA, rB, formA, formB, strA, strB, allA, allB, h2h, streakA,
 // ─── Drawdown Detection ────────────────────────────────────────────────────
 
 function getDrawdownState(state) {
-  const bankrollPct = (state.bankroll / state.initialBankroll) * 100;
+  const deployed = (state.openPositions || []).reduce((s, p) => s + p.betSize, 0);
+  const totalBankroll = state.bankroll + deployed; // cash + money in open bets
+  const bankrollPct = (totalBankroll / state.initialBankroll) * 100;
   const closed = state.closedPositions || [];
 
   // Count consecutive losses from most recent
@@ -1698,7 +1700,6 @@ async function handleTelegramCommand(text) {
   }
 
   if (cmd === "/status" || cmd === "/stats") {
-    const pnl = state.bankroll - (state.initialBankroll || 1000);
     const closed = state.closedPositions || [];
     const open = state.openPositions || [];
     const wins = closed.filter(p => p.result === "win").length;
@@ -1706,15 +1707,17 @@ async function handleTelegramCommand(text) {
     const total = wins + losses;
     const hitRate = total > 0 ? (wins / total * 100).toFixed(1) : "0.0";
     const deployed = open.reduce((s, p) => s + p.betSize, 0);
+    const totalBankroll = state.bankroll + deployed; // cash + money in open bets
+    const pnl = totalBankroll - (state.initialBankroll || 1000);
     const totalPnl = closed.reduce((s, p) => s + (p.pnl || 0), 0);
     const avgEdge = closed.length > 0 ? (closed.reduce((s, p) => s + (p.edge || 0), 0) / closed.length).toFixed(1) : "0.0";
 
     const w = state.modelWeights || {};
 
     let msg = `📈 <b>BOT STATUS</b>\n\n`;
-    msg += `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n`;
+    msg += `🏦 Bankroll: <b>$${totalBankroll.toFixed(2)}</b> ($${state.bankroll.toFixed(2)} cash + $${deployed.toFixed(2)} in bets)\n`;
     msg += `💰 P&L: <b>${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</b> (${pnl >= 0 ? "+" : ""}${((pnl / (state.initialBankroll || 1000)) * 100).toFixed(1)}%)\n`;
-    msg += `📊 Deployed: $${deployed.toFixed(0)} (${(deployed / state.bankroll * 100).toFixed(0)}%)\n\n`;
+    msg += `📊 Deployed: $${deployed.toFixed(0)} across ${open.length} open bet${open.length !== 1 ? "s" : ""}\n\n`;
     msg += `🎯 <b>RECORD</b>\n`;
     msg += `   ${wins}W - ${losses}L (${hitRate}% hit rate)\n`;
     msg += `   Avg edge: ${avgEdge}%\n`;
@@ -1790,7 +1793,9 @@ async function handleTelegramCommand(text) {
   if (cmd === "/summary") {
     const closed = state.closedPositions || [];
     const open = state.openPositions || [];
-    const totalPnl = state.bankroll - (state.initialBankroll || 1000);
+    const deployed = open.reduce((s, p) => s + p.betSize, 0);
+    const totalBankroll = state.bankroll + deployed;
+    const totalPnl = totalBankroll - (state.initialBankroll || 1000);
     const allWins = closed.filter(p => p.result === "win").length;
     const allLosses = closed.filter(p => p.result === "loss").length;
 
@@ -1831,7 +1836,7 @@ async function handleTelegramCommand(text) {
     });
 
     let msg = `📊 <b>FULL SUMMARY</b>\n\n`;
-    msg += `🏦 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n`;
+    msg += `🏦 Bankroll: <b>$${totalBankroll.toFixed(2)}</b> ($${state.bankroll.toFixed(2)} cash + $${deployed.toFixed(2)} in bets)\n`;
     msg += `💰 P&L: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b> (${(totalPnl / (state.initialBankroll || 1000) * 100).toFixed(1)}% ROI)\n`;
     msg += `🎯 Record: <b>${allWins}W - ${allLosses}L</b> (${allWins + allLosses > 0 ? (allWins / (allWins + allLosses) * 100).toFixed(0) : 0}%)\n\n`;
 
