@@ -693,7 +693,7 @@ export default function App() {
           {[
             { id: "predictions", label: "Predictions" },
             { id: "log", label: `Bet Log${betLog.length ? ` (${betLog.length})` : ""}` },
-            { id: "bot", label: `Bot${botState ? ` $${botState.bankroll?.toFixed(0)}` : ""}` },
+            { id: "bot", label: `Bot${botState ? ` $${((botState.bankroll || 0) + (botState.openPositions || []).reduce((s, p) => s + p.betSize, 0)).toFixed(0)}` : ""}` },
             { id: "daily", label: "Daily Recap" },
           ].map(v => (
             <button key={v.id} onClick={() => { setView(v.id); setSelectedDay(null); }} style={{
@@ -1028,14 +1028,15 @@ export default function App() {
               const closed = botState.closedPositions || [];
               const open = botState.openPositions || [];
               const initial = botState.initialBankroll || 1000;
-              const pnl = botState.bankroll - initial;
+              const deployed = open.reduce((s, p) => s + p.betSize, 0);
+              const totalEquity = botState.bankroll + deployed;
+              const pnl = totalEquity - initial;
               const roi = (pnl / initial * 100);
               const wins = closed.filter(p => p.result === "win").length;
               const losses = closed.filter(p => p.result === "loss").length;
               const totalResolved = wins + losses;
               const hitRate = totalResolved > 0 ? (wins / totalResolved * 100) : 0;
               const totalPnl = closed.reduce((s, p) => s + (p.pnl || 0), 0);
-              const deployed = open.reduce((s, p) => s + p.betSize, 0);
               const avgEdge = closed.length > 0 ? (closed.reduce((s, p) => s + (p.edge || 0), 0) / closed.length) : 0;
               const avgBet = closed.length > 0 ? (closed.reduce((s, p) => s + p.betSize, 0) / closed.length) : 0;
               const bestTrade = closed.length > 0 ? closed.reduce((best, p) => (p.pnl || 0) > (best.pnl || 0) ? p : best, closed[0]) : null;
@@ -1098,8 +1099,8 @@ export default function App() {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
                 <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
                   <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>Bankroll</div>
-                  <div style={{ fontSize: 28, fontWeight: 800, color: pnl >= 0 ? PAL.green : PAL.red, lineHeight: 1 }}>${botState.bankroll?.toFixed(2)}</div>
-                  <div style={{ fontSize: 12, color: PAL.dim, marginTop: 6 }}>${deployed.toFixed(0)} deployed · ${(botState.bankroll + deployed).toFixed(0)} total</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: pnl >= 0 ? PAL.green : PAL.red, lineHeight: 1 }}>${totalEquity.toFixed(2)}</div>
+                  <div style={{ fontSize: 12, color: PAL.dim, marginTop: 6 }}>${botState.bankroll?.toFixed(0)} cash · ${deployed.toFixed(0)} in open bets</div>
                 </div>
                 <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
                   <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>P&L</div>
@@ -1528,7 +1529,7 @@ export default function App() {
                     <NumCard label="Days Active" value={totalDays} color={PAL.purple} />
                     <NumCard label="Green Days" value={winDays} color={PAL.green} sub={`${lossDays} red days`} />
                     <NumCard label="Total Trades" value={closed.length + open.length} color={PAL.text} sub={`${open.length} still open`} />
-                    <NumCard label="Current Bankroll" value={`$${botState.bankroll?.toFixed(0)}`} color={botState.bankroll >= initial ? PAL.green : PAL.red} sub={`Started $${initial}`} />
+                    <NumCard label="Current Bankroll" value={`$${((botState.bankroll || 0) + open.reduce((s, p) => s + p.betSize, 0)).toFixed(0)}`} color={((botState.bankroll || 0) + open.reduce((s, p) => s + p.betSize, 0)) >= initial ? PAL.green : PAL.red} sub={`$${botState.bankroll?.toFixed(0)} cash · $${open.reduce((s, p) => s + p.betSize, 0).toFixed(0)} in bets`} />
                   </div>
                 )}
 
