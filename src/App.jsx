@@ -352,6 +352,7 @@ export default function App() {
   const [gameFilter, setGameFilter] = useState("all"); // all | csgo | dota2 | lol
   const [sortBy, setSortBy] = useState("time"); // time | edge
   const [expandedMatch, setExpandedMatch] = useState(null);
+  const [selectedDay, setSelectedDay] = useState(null);
 
   // Match data
   const [upcoming, setUpcoming] = useState([]); // unified list of upcoming matches across all games
@@ -674,7 +675,7 @@ export default function App() {
             { id: "bot", label: `Bot${botState ? ` $${botState.bankroll?.toFixed(0)}` : ""}` },
             { id: "daily", label: "Daily Recap" },
           ].map(v => (
-            <button key={v.id} onClick={() => setView(v.id)} style={{
+            <button key={v.id} onClick={() => { setView(v.id); setSelectedDay(null); }} style={{
               width: "100%", padding: "7px 8px", borderRadius: 6, border: "none",
               background: view === v.id ? PAL.card : "transparent",
               color: view === v.id ? PAL.text : PAL.sub,
@@ -1354,6 +1355,11 @@ export default function App() {
           {/* ─── DAILY RECAP VIEW ─── */}
           {view === "daily" && (<>
             <div style={{ marginBottom: 16 }}>
+              {selectedDay ? (
+                <button onClick={() => setSelectedDay(null)} style={{ background: "none", border: "none", color: PAL.blue, cursor: "pointer", fontSize: 14, fontFamily: "inherit", padding: 0, marginBottom: 8, display: "flex", alignItems: "center", gap: 4 }}>
+                  ← Back to all days
+                </button>
+              ) : null}
               <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: "-0.03em", margin: 0 }}>Daily Recap</h1>
               <p style={{ fontSize: 13, color: PAL.sub, marginTop: 4 }}>Day-by-day breakdown for content</p>
             </div>
@@ -1419,17 +1425,21 @@ export default function App() {
               const winDays = days.filter(d => d.resolved.reduce((s, p) => s + (p.pnl || 0), 0) > 0).length;
               const lossDays = days.filter(d => d.resolved.length > 0 && d.resolved.reduce((s, p) => s + (p.pnl || 0), 0) <= 0).length;
 
+              const filteredDays = selectedDay ? days.filter(d => d.date === selectedDay) : days;
+
               return (<>
                 {/* Cumulative header */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 18 }}>
-                  <NumCard label="Days Active" value={totalDays} color={PAL.purple} />
-                  <NumCard label="Green Days" value={winDays} color={PAL.green} sub={`${lossDays} red days`} />
-                  <NumCard label="Total Trades" value={closed.length + open.length} color={PAL.text} sub={`${open.length} still open`} />
-                  <NumCard label="Current Bankroll" value={`$${botState.bankroll?.toFixed(0)}`} color={botState.bankroll >= initial ? PAL.green : PAL.red} sub={`Started $${initial}`} />
-                </div>
+                {!selectedDay && (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 18 }}>
+                    <NumCard label="Days Active" value={totalDays} color={PAL.purple} />
+                    <NumCard label="Green Days" value={winDays} color={PAL.green} sub={`${lossDays} red days`} />
+                    <NumCard label="Total Trades" value={closed.length + open.length} color={PAL.text} sub={`${open.length} still open`} />
+                    <NumCard label="Current Bankroll" value={`$${botState.bankroll?.toFixed(0)}`} color={botState.bankroll >= initial ? PAL.green : PAL.red} sub={`Started $${initial}`} />
+                  </div>
+                )}
 
                 {/* Day-by-day cards */}
-                {days.map((day, dayIdx) => {
+                {filteredDays.map((day, dayIdx) => {
                   const dayDate = new Date(day.date + "T12:00:00Z");
                   const dateLabel = dayDate.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
                   const isToday = day.date === new Date().toISOString().slice(0, 10);
@@ -1518,11 +1528,15 @@ export default function App() {
                   return (
                     <div key={day.date} style={{ marginBottom: 16, background: PAL.panel, borderRadius: 12, border: `1px solid ${isToday ? PAL.purple + "50" : PAL.border}`, overflow: "hidden" }}>
                       {/* Day Header */}
-                      <div style={{
-                        padding: "14px 18px", display: "flex", justifyContent: "space-between", alignItems: "center",
-                        background: isToday ? `${PAL.purple}08` : "transparent",
-                        borderBottom: `1px solid ${PAL.border}`,
-                      }}>
+                      <div
+                        onClick={() => !selectedDay && setSelectedDay(day.date)}
+                        style={{
+                          padding: "14px 18px", display: "flex", justifyContent: "space-between", alignItems: "center",
+                          background: isToday ? `${PAL.purple}08` : "transparent",
+                          borderBottom: `1px solid ${PAL.border}`,
+                          cursor: selectedDay ? "default" : "pointer",
+                        }}
+                      >
                         <div>
                           <div style={{ fontSize: 16, fontWeight: 800, display: "flex", alignItems: "center", gap: 8 }}>
                             {dayLabel}
@@ -1548,6 +1562,43 @@ export default function App() {
                               <div style={{ fontSize: 11, color: PAL.dim }}>{dayPlaced.length} bet{dayPlaced.length > 1 ? "s" : ""} placed</div>
                             </div>
                           )}
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const winRate = dayResolved.length > 0 ? ((dayWins.length / dayResolved.length) * 100).toFixed(0) : "N/A";
+                              const tradesText = dayPlaced.map(p => {
+                                const resolved = dayResolved.find(r => r.id === p.id);
+                                const opponent = p.opponent || p.event || "Unknown";
+                                if (resolved) {
+                                  return `- ${p.pick} vs ${opponent} → ${resolved.result === "win" ? "WIN" : "LOSS"} ${(resolved.pnl || 0) >= 0 ? "+" : ""}$${(resolved.pnl || 0).toFixed(2)} (Model: ${p.ourProb}%, Market: ${p.marketProb}%)`;
+                                }
+                                return `- ${p.pick} vs ${opponent} → PENDING (Model: ${p.ourProb}%, Market: ${p.marketProb}%)`;
+                              }).join("\n");
+                              const tpText = talkingPoints.map(tp => `- ${tp.text}`).join("\n");
+                              const summary = [
+                                `${dateLabel} — Edge Terminal Bot`,
+                                `P&L: ${dayPnl >= 0 ? "+" : ""}$${dayPnl.toFixed(2)} | Record: ${dayWins.length}W-${dayLosses.length}L | Win Rate: ${winRate}%`,
+                                `Bankroll: $${(dayBk.bankroll || 0).toFixed(2)} after this day`,
+                                "",
+                                "Trades:",
+                                tradesText || "- No trades",
+                                "",
+                                "Talking Points:",
+                                tpText || "- None",
+                              ].join("\n");
+                              navigator.clipboard.writeText(summary).then(() => {
+                                const btn = e.currentTarget;
+                                const orig = btn.textContent;
+                                btn.textContent = "✓ Copied!";
+                                setTimeout(() => { btn.textContent = orig; }, 1500);
+                              });
+                            }}
+                            style={{
+                              background: `${PAL.purple}15`, border: `1px solid ${PAL.purple}30`, color: PAL.purple,
+                              cursor: "pointer", fontSize: 11, fontWeight: 600, fontFamily: "inherit",
+                              padding: "4px 10px", borderRadius: 6, whiteSpace: "nowrap",
+                            }}
+                          >📋 Copy Summary</button>
                         </div>
                       </div>
 
