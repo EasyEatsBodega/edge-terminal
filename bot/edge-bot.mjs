@@ -15,6 +15,7 @@ import { checkMatchRosters } from "./liquipedia.mjs";
 import { fetchPinnacleAllEsports, matchPinnacle } from "./pinnacle.mjs";
 import { getOpenDotaRating, getOpenDotaRatingDelta, ratingDeltaToProbAdjust as odRatingToProbAdjust } from "./opendota.mjs";
 import { getVlrRank, getVlrRankDelta, vlrRankDeltaToProbAdjust } from "./vlr.mjs";
+import { getCurrentLolPatch, filterToCurrentPatch, patchBreakdown } from "./lol.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "config.json");
@@ -468,8 +469,26 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     return (recent5WR - prev5WR) * 6;
   };
 
-  const rA = getResults(histA, teamAId);
-  const rB = getResults(histB, teamBId);
+  let rA = getResults(histA, teamAId);
+  let rB = getResults(histB, teamBId);
+
+  // ─── LoL Patch Filter ─────────────────────────────────────────────────
+  // LoL meta shifts every ~2 weeks on patch day. Matches from prior patches
+  // are on different champion balance and shouldn't count as equal evidence.
+  // Filter team history to current patch (with previous-patch fallback if
+  // data is thin). Does NOT apply to other games where meta is more stable.
+  let lolPatch = null, patchBreakdownA = null, patchBreakdownB = null;
+  if (game === "lol") {
+    try {
+      lolPatch = await getCurrentLolPatch();
+      patchBreakdownA = patchBreakdown(rA, lolPatch);
+      patchBreakdownB = patchBreakdown(rB, lolPatch);
+      rA = filterToCurrentPatch(rA, lolPatch.releaseDate, 4);
+      rB = filterToCurrentPatch(rB, lolPatch.releaseDate, 4);
+    } catch (e) {
+      // ddragon unreachable — use full history
+    }
+  }
 
   const formA = recentFormWR(rA, 10);
   const formB = recentFormWR(rB, 10);
@@ -608,6 +627,11 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     thesis += ` VLR.gg: ${teamBName} ranked #${vlrRankB.rank}, ${teamAName} unranked.`;
   }
 
+  // Append LoL patch context (LoL only)
+  if (lolPatch && patchBreakdownA && patchBreakdownB) {
+    thesis += ` Patch ${lolPatch.minor}: ${teamAName} ${patchBreakdownA.currentPatchWins}-${patchBreakdownA.currentPatchGames - patchBreakdownA.currentPatchWins} vs ${teamBName} ${patchBreakdownB.currentPatchWins}-${patchBreakdownB.currentPatchGames - patchBreakdownB.currentPatchWins}.`;
+  }
+
   return {
     probA: prob, probB: 100 - prob, confidence, thesis,
     formA: recentFormWR(rA, 10), formB: recentFormWR(rB, 10),
@@ -624,6 +648,7 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     hltvRankA, hltvRankB, hltvAdjust,
     odRatingA, odRatingB, odAdjust,
     vlrRankA, vlrRankB, vlrAdjust,
+    lolPatch, patchBreakdownA, patchBreakdownB,
   };
 }
 
