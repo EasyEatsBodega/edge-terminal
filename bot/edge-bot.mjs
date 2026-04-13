@@ -13,6 +13,7 @@ import { execSync } from "node:child_process";
 import { getHltvRankDelta, rankDeltaToProbAdjust } from "./hltv.mjs";
 import { checkMatchRosters } from "./liquipedia.mjs";
 import { fetchPinnacleAllEsports, matchPinnacle } from "./pinnacle.mjs";
+import { getOpenDotaRating, getOpenDotaRatingDelta, ratingDeltaToProbAdjust as odRatingToProbAdjust } from "./opendota.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "config.json");
@@ -523,6 +524,27 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     }
   }
 
+  // ─── OpenDota Rating Adjustment (Dota 2 only) ─────────────────────────
+  // OpenDota maintains Elo-style ratings for all pro teams. Captures team
+  // strength across all leagues, which plain W/L % misses (beating tier-3
+  // teams is not the same as beating tier-1). Max ±12% influence.
+  let odRatingA = null, odRatingB = null, odAdjust = 0;
+  if (game === "dota2" && teamAName && teamBName) {
+    try {
+      const [aRating, bRating, delta] = await Promise.all([
+        getOpenDotaRating(teamAName),
+        getOpenDotaRating(teamBName),
+        getOpenDotaRatingDelta(teamAName, teamBName),
+      ]);
+      odRatingA = aRating;
+      odRatingB = bRating;
+      odAdjust = odRatingToProbAdjust(delta);
+      prob += odAdjust;
+    } catch (e) {
+      // OpenDota unavailable — skip
+    }
+  }
+
   // BO format adjustment — game-specific volatility
   const bo = format || 1;
   const gt = game ? GAME_TUNING[game] : null;
@@ -537,11 +559,18 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
   let confidence = Math.min(rA.length, rB.length) >= 8 ? "high" : Math.min(rA.length, rB.length) >= 4 ? "medium" : "low";
   if (maxRust > 0.05 && confidence === "high") confidence = "medium";  // Rusty team = less certain
 
-  const thesis = buildThesis(
+  let thesis = buildThesis(
     rA, rB, formA, formB, strengthA, strengthB, allA, allB,
     h2h, streakA, streakB, bo, prob,
     teamAId, teamBId, domA, domB, clutchA, clutchB, trajA, trajB, rustA, rustB
   );
+
+  // Append OpenDota context if available (Dota 2 only)
+  if (odRatingA && odRatingB) {
+    const ratingGap = odRatingA.rating - odRatingB.rating;
+    const whoLead = ratingGap > 0 ? teamAName : teamBName;
+    thesis += ` OpenDota rating: ${teamAName} ${odRatingA.rating} vs ${teamBName} ${odRatingB.rating} (${Math.abs(ratingGap)}-pt edge to ${whoLead}).`;
+  }
 
   return {
     probA: prob, probB: 100 - prob, confidence, thesis,
@@ -556,6 +585,8 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     recordA: `${rA.filter(r => r.won).length}-${rA.filter(r => !r.won).length}`,
     recordB: `${rB.filter(r => r.won).length}-${rB.filter(r => !r.won).length}`,
     dataPointsA: rA.length, dataPointsB: rB.length,
+    hltvRankA, hltvRankB, hltvAdjust,
+    odRatingA, odRatingB, odAdjust,
   };
 }
 
