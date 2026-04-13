@@ -14,6 +14,7 @@ import { getHltvRankDelta, rankDeltaToProbAdjust } from "./hltv.mjs";
 import { checkMatchRosters } from "./liquipedia.mjs";
 import { fetchPinnacleAllEsports, matchPinnacle } from "./pinnacle.mjs";
 import { getOpenDotaRating, getOpenDotaRatingDelta, ratingDeltaToProbAdjust as odRatingToProbAdjust } from "./opendota.mjs";
+import { getVlrRank, getVlrRankDelta, vlrRankDeltaToProbAdjust } from "./vlr.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "config.json");
@@ -545,6 +546,27 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     }
   }
 
+  // ─── VLR.gg Ranking Adjustment (Valorant only) ────────────────────────
+  // VLR merges regional rankings (Americas/EMEA/Pacific/China/East-Asia) by
+  // points. Captures map pool, agent comp diversity, international results
+  // our W/L model can't see. Max ±12% influence.
+  let vlrRankA = null, vlrRankB = null, vlrAdjust = 0;
+  if (game === "valorant" && teamAName && teamBName) {
+    try {
+      const [aRank, bRank, delta] = await Promise.all([
+        getVlrRank(teamAName),
+        getVlrRank(teamBName),
+        getVlrRankDelta(teamAName, teamBName),
+      ]);
+      vlrRankA = aRank;
+      vlrRankB = bRank;
+      vlrAdjust = vlrRankDeltaToProbAdjust(delta);
+      prob += vlrAdjust;
+    } catch (e) {
+      // VLR unavailable — skip
+    }
+  }
+
   // BO format adjustment — game-specific volatility
   const bo = format || 1;
   const gt = game ? GAME_TUNING[game] : null;
@@ -572,6 +594,15 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     thesis += ` OpenDota rating: ${teamAName} ${odRatingA.rating} vs ${teamBName} ${odRatingB.rating} (${Math.abs(ratingGap)}-pt edge to ${whoLead}).`;
   }
 
+  // Append VLR context if available (Valorant only)
+  if (vlrRankA && vlrRankB) {
+    thesis += ` VLR.gg: ${teamAName} #${vlrRankA.rank} (${vlrRankA.points} pts) vs ${teamBName} #${vlrRankB.rank} (${vlrRankB.points} pts).`;
+  } else if (vlrRankA && !vlrRankB) {
+    thesis += ` VLR.gg: ${teamAName} ranked #${vlrRankA.rank}, ${teamBName} unranked.`;
+  } else if (!vlrRankA && vlrRankB) {
+    thesis += ` VLR.gg: ${teamBName} ranked #${vlrRankB.rank}, ${teamAName} unranked.`;
+  }
+
   return {
     probA: prob, probB: 100 - prob, confidence, thesis,
     formA: recentFormWR(rA, 10), formB: recentFormWR(rB, 10),
@@ -587,6 +618,7 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     dataPointsA: rA.length, dataPointsB: rB.length,
     hltvRankA, hltvRankB, hltvAdjust,
     odRatingA, odRatingB, odAdjust,
+    vlrRankA, vlrRankB, vlrAdjust,
   };
 }
 
