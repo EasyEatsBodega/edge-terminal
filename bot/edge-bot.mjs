@@ -791,6 +791,31 @@ function getDrawdownState(state) {
   return { bankrollPct, consecLosses, halted, survival, onCooldown, sizeMult };
 }
 
+// ─── Daily Reset (EST) ──────────────────────────────────────────────────────
+// Returns a YYYY-MM-DD string for a Date, interpreted in America/New_York.
+// Handles DST automatically. Used to bucket closedPositions into "today" vs
+// "yesterday" with midnight EST as the reset point.
+function estDayKey(date) {
+  // en-CA gives YYYY-MM-DD ordering natively
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(date);
+}
+
+// Summary stats for all bets resolved on the current EST day.
+function getTodayStats(closedPositions, now = new Date()) {
+  const today = estDayKey(now);
+  const todays = (closedPositions || []).filter(p => {
+    const when = p.resolvedAt || p.placedAt;
+    return when && estDayKey(new Date(when)) === today;
+  });
+  const wins = todays.filter(p => p.result === "win").length;
+  const losses = todays.filter(p => p.result === "loss").length;
+  const pnl = todays.reduce((s, p) => s + (p.pnl || 0), 0);
+  return { wins, losses, pnl, count: todays.length, date: today };
+}
+
 // ─── Loss Diagnostic ───────────────────────────────────────────────────────
 // Generates a human-readable explanation of WHY a bet lost. Uses the full
 // data we have on the position — ourProb, rawProb (pre-calibration),
@@ -1162,8 +1187,15 @@ async function runBot() {
       const totalPnl = resolvedForTG.reduce((s, r) => s + r.pnl, 0);
       const headerEmoji = totalPnl >= 0 ? "📈" : "📉";
       const pnlSign = totalPnl >= 0 ? "+" : "";
+
+      // Day-to-date tally (resets midnight EST). Covers this run's bets
+      // since they're already in closedPositions after saveState above.
+      const today = getTodayStats(state.closedPositions, now);
+      const todaySign = today.pnl >= 0 ? "+" : "";
+
       let msg = `${headerEmoji} <b>${resolvedForTG.length} BET${resolvedForTG.length === 1 ? "" : "S"} RESOLVED</b> — ${wins}W/${losses}L · ${pnlSign}$${totalPnl.toFixed(2)}\n`;
-      msg += `Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n`;
+      msg += `📅 <b>Today (EST)</b>: ${today.wins}W/${today.losses}L · ${todaySign}$${today.pnl.toFixed(2)}\n`;
+      msg += `💰 Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n`;
       for (const r of resolvedForTG) {
         const pnlStr = r.pnl >= 0 ? `+$${r.pnl.toFixed(2)}` : `-$${Math.abs(r.pnl).toFixed(2)}`;
         msg += `\n${r.emoji} <b>${r.pos.pick}</b> (${r.pos.event}) ${pnlStr}`;

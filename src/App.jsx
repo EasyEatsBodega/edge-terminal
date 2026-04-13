@@ -19,6 +19,26 @@ const GAME_SLUG = { csgo: "csgo", dota2: "dota2", lol: "lol", valorant: "valoran
 const save = (k, v) => { try { localStorage.setItem(`et2_${k}`, JSON.stringify(v)); } catch(e){} };
 const load = (k, fb) => { try { const v = localStorage.getItem(`et2_${k}`); return v ? JSON.parse(v) : fb; } catch(e){ return fb; } };
 
+// ─── EST day bucketing (mirrors bot/edge-bot.mjs estDayKey) ────────────────
+// Day resets at midnight America/New_York (handles DST). All daily stats
+// use this so bot + dashboard agree on where "today" begins and ends.
+const estDayKey = (date) => new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/New_York",
+  year: "numeric", month: "2-digit", day: "2-digit",
+}).format(date);
+
+function getTodayStats(closedPositions, now = new Date()) {
+  const today = estDayKey(now);
+  const todays = (closedPositions || []).filter(p => {
+    const when = p.resolvedAt || p.placedAt;
+    return when && estDayKey(new Date(when)) === today;
+  });
+  const wins = todays.filter(p => p.result === "win").length;
+  const losses = todays.filter(p => p.result === "loss").length;
+  const pnl = todays.reduce((s, p) => s + (p.pnl || 0), 0);
+  return { wins, losses, pnl, count: todays.length, date: today };
+}
+
 // ─── Loss Diagnostic (mirrors bot/edge-bot.mjs diagnoseLoss) ───────────────
 // Re-computed on every render so improvements to diagnostic logic apply
 // retroactively to existing closed positions. Keep this in sync with the bot.
@@ -1148,6 +1168,30 @@ export default function App() {
               });
 
               return (<>
+              {(() => {
+                const today = getTodayStats(closed);
+                const todayHit = today.count > 0 ? (today.wins / today.count * 100) : 0;
+                return (
+              <>
+              {/* Today (EST) — resets at midnight America/New_York */}
+              <div style={{ background: PAL.panel, borderRadius: 10, padding: "14px 18px", border: `1px solid ${PAL.purple}40`, marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 11, color: PAL.purple, fontWeight: 600, letterSpacing: "0.05em" }}>TODAY (EST)</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, marginTop: 2 }}>
+                    {today.wins}W - {today.losses}L
+                    <span style={{ fontSize: 14, fontWeight: 600, color: PAL.dim, marginLeft: 8 }}>
+                      {today.count > 0 ? `${todayHit.toFixed(0)}% hit` : "no bets yet"}
+                    </span>
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 11, color: PAL.dim }}>Day P&L</div>
+                  <div style={{ fontSize: 24, fontWeight: 800, color: today.pnl >= 0 ? PAL.green : PAL.red }}>
+                    {today.pnl >= 0 ? "+" : ""}${today.pnl.toFixed(2)}
+                  </div>
+                </div>
+              </div>
+
               {/* Hero Stats */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
                 <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
@@ -1156,12 +1200,12 @@ export default function App() {
                   <div style={{ fontSize: 12, color: PAL.dim, marginTop: 6 }}>${botState.bankroll?.toFixed(0)} cash · ${deployed.toFixed(0)} in open bets</div>
                 </div>
                 <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
-                  <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>P&L</div>
+                  <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>All-Time P&L</div>
                   <div style={{ fontSize: 28, fontWeight: 800, color: pnl >= 0 ? PAL.green : PAL.red, lineHeight: 1 }}>{pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}</div>
                   <div style={{ fontSize: 12, color: pnl >= 0 ? PAL.green : PAL.red, marginTop: 6 }}>{roi >= 0 ? "+" : ""}{roi.toFixed(1)}% ROI</div>
                 </div>
                 <div style={{ background: PAL.panel, borderRadius: 10, padding: "16px 18px", border: `1px solid ${PAL.border}` }}>
-                  <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>Record</div>
+                  <div style={{ fontSize: 11, color: PAL.dim, marginBottom: 4 }}>All-Time Record</div>
                   <div style={{ fontSize: 28, fontWeight: 800, color: PAL.text, lineHeight: 1 }}>{wins}W - {losses}L</div>
                   <div style={{ fontSize: 12, color: hitRate >= 50 ? PAL.green : PAL.red, marginTop: 6 }}>
                     {hitRate.toFixed(0)}% hit rate
@@ -1169,6 +1213,9 @@ export default function App() {
                   </div>
                 </div>
               </div>
+              </>
+                );
+              })()}
 
               {/* Secondary Stats */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 18 }}>
