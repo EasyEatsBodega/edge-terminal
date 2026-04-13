@@ -992,6 +992,11 @@ async function runBot() {
     // Defends against a race where two processes both see the position as open
     // and both try to resolve it. The second will skip.
     const resolvedIds = new Set(state.closedPositions.map(p => p.id));
+    // Also track matchIds ever resolved — if a stale open position's matchId
+    // is in here but its ID isn't (e.g. old broken state with divergent IDs),
+    // we still know the match resolved and should drop it. Fixes bots stuck
+    // in a bad state from earlier concurrency bugs.
+    const resolvedMatchIds = new Set(state.closedPositions.map(p => p.matchId).filter(Boolean));
 
     for (const pos of state.openPositions) {
       if (!toResolve.includes(pos)) { stillOpen.push(pos); continue; }
@@ -1001,6 +1006,15 @@ async function runBot() {
       // Telegram, no double P&L accounting.
       if (resolvedIds.has(pos.id)) {
         push(`⏭️  ${pos.pick} (${pos.event}) already resolved — skipping duplicate.`);
+        continue;
+      }
+      // Matchup-level idempotency: if this match already has a resolved
+      // position (possibly under a different ID from an earlier buggy run),
+      // drop without resolving. Prevents the "stuck in a loop" pattern where
+      // an old concurrency bug left positions in openPositions that keep
+      // re-resolving on every run.
+      if (pos.matchId && resolvedMatchIds.has(pos.matchId)) {
+        push(`⏭️  ${pos.pick} (${pos.event}) match already resolved under another ID — purging.`);
         continue;
       }
 
@@ -1069,6 +1083,15 @@ async function runBot() {
       }
     }
     state.openPositions = stillOpen;
+
+    // CRITICAL: persist resolution state IMMEDIATELY. If any later step in
+    // runBot throws (bet-finding, Polymarket, Pinnacle, etc.), we do NOT want
+    // to replay resolutions on the next run — that's what was causing the
+    // "same 5 bets resolved every 5 minutes" spam. Resolution is the point
+    // of no return: once sent, save it and never look back.
+    if (resolvedForTG.length > 0) {
+      saveState(state);
+    }
 
     // Send ONE summary Telegram for all resolutions this run. Much better UX
     // than spamming N messages when a BO3 tournament day has 5 matches finish
