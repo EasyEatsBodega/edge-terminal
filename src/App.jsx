@@ -19,6 +19,44 @@ const GAME_SLUG = { csgo: "csgo", dota2: "dota2", lol: "lol", valorant: "valoran
 const save = (k, v) => { try { localStorage.setItem(`et2_${k}`, JSON.stringify(v)); } catch(e){} };
 const load = (k, fb) => { try { const v = localStorage.getItem(`et2_${k}`); return v ? JSON.parse(v) : fb; } catch(e){ return fb; } };
 
+// ─── Loss Diagnostic (mirrors bot/edge-bot.mjs diagnoseLoss) ───────────────
+// Re-computed on every render so improvements to diagnostic logic apply
+// retroactively to existing closed positions. Keep this in sync with the bot.
+function diagnoseLoss(pos) {
+  if (!pos || pos.result !== "loss") return null;
+  const { ourProb, marketProb, pinnacleProb, edge, rawProb, format, confidence } = pos;
+  const lossOdds = 100 - ourProb;
+
+  if (pinnacleProb != null) {
+    if (pinnacleProb < 50) {
+      return `Sharp fade: Pinnacle had this pick at ${pinnacleProb}% (underdog) — sharp book disagreed with us`;
+    }
+    if (pinnacleProb < ourProb - 8) {
+      return `Overrated by model: Pinnacle ${pinnacleProb}% vs our ${ourProb}% — sharp book saw it much closer`;
+    }
+  }
+  if (rawProb != null && rawProb >= 78 && Math.abs(rawProb - ourProb) < 3) {
+    return `Untempered model: raw prediction was ${rawProb}% — calibration data too sparse to shrink it`;
+  }
+  if (format === 1) {
+    return `BO1 variance: single-map format — even a ${ourProb}% favorite loses ~${Math.round(lossOdds)}% of the time`;
+  }
+  if (edge < 5 && ourProb < 65) {
+    return `Should have passed: only ${edge?.toFixed ? edge.toFixed(1) : edge}% edge on a ${ourProb}% pick`;
+  }
+  if (confidence === "low") {
+    return `Thin history: confidence was "low" at bet time — not enough recent matches`;
+  }
+  if (ourProb >= 75) {
+    const frac = Math.max(2, Math.round(100 / lossOdds));
+    return `Variance loss: ${ourProb}% pick still loses 1-in-${frac}; the math catches up eventually`;
+  }
+  if (ourProb >= 65) {
+    return `Expected variance: ${ourProb}% pick carries ${Math.round(lossOdds)}% base loss rate`;
+  }
+  return `Marginal call: we had ${ourProb}%, market had ${marketProb}% — market was closer to reality`;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CHANGELOG — day-by-day bot updates for YouTube content
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1091,10 +1129,16 @@ export default function App() {
                 if (mktSaysWin === actualWin) mktRight++;
               });
 
-              // Loss reasons
+              // Loss reasons — re-diagnosed from stored data so improvements
+              // to diagnoseLoss() retroactively fix past loss classifications.
               const lossReasons = {};
-              closed.filter(p => p.lossReason).forEach(p => {
-                lossReasons[p.lossReason] = (lossReasons[p.lossReason] || 0) + 1;
+              closed.filter(p => p.result === "loss").forEach(p => {
+                const reason = diagnoseLoss(p) || p.lossReason;
+                if (!reason) return;
+                // Shorten long reasons for the aggregation display — use first
+                // sentence fragment before " — " or " : " so counts group well.
+                const short = reason.split(/[—:]/)[0].trim();
+                lossReasons[short] = (lossReasons[short] || 0) + 1;
               });
 
               return (<>
@@ -1434,9 +1478,9 @@ export default function App() {
                                 {p.thesis}
                               </div>
                             )}
-                            {p.lossReason && (
+                            {p.result === "loss" && (
                               <div style={{ padding: "4px 14px 6px", fontSize: 10, color: PAL.red, fontStyle: "italic", background: `${PAL.red}05`, borderRadius: "0 0 6px 6px", marginTop: -2 }}>
-                                Loss reason: {p.lossReason}
+                                Why we lost: {diagnoseLoss(p) || p.lossReason}
                               </div>
                             )}
                           </div>
@@ -1605,10 +1649,10 @@ export default function App() {
                     talkingPoints.push({ icon: "trophy", text: `Best trade: ${bestTrade.pick} in ${bestTrade.event} → +$${(bestTrade.pnl || 0).toFixed(2)}` });
                   }
 
-                  // Loss analysis
-                  const lossReasons = dayLosses.filter(p => p.lossReason).map(p => p.lossReason);
+                  // Loss analysis — re-diagnosed with current logic
+                  const lossReasons = dayLosses.map(p => diagnoseLoss(p) || p.lossReason).filter(Boolean);
                   if (lossReasons.length > 0) {
-                    const uniqueReasons = [...new Set(lossReasons)];
+                    const uniqueReasons = [...new Set(lossReasons.map(r => r.split(/[—:]/)[0].trim()))];
                     talkingPoints.push({ icon: "analyze", text: `Loss breakdown: ${uniqueReasons.join("; ")}` });
                   }
 

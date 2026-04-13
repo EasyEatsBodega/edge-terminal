@@ -791,6 +791,70 @@ function getDrawdownState(state) {
   return { bankrollPct, consecLosses, halted, survival, onCooldown, sizeMult };
 }
 
+// ─── Loss Diagnostic ───────────────────────────────────────────────────────
+// Generates a human-readable explanation of WHY a bet lost. Uses the full
+// data we have on the position — ourProb, rawProb (pre-calibration),
+// marketProb (Polymarket), pinnacleProb (sharp book), edge, format,
+// confidence — to pick the most informative story, not a tautology.
+//
+// Priority order: sharpest signal first. Pinnacle disagreement > calibration
+// overreach > format variance > thin-edge > expected variance.
+function diagnoseLoss(pos) {
+  const ourProb = pos.ourProb;
+  const marketProb = pos.marketProb;
+  const pinnacleProb = pos.pinnacleProb;
+  const edge = pos.edge;
+  const rawProb = pos.rawProb;
+  const format = pos.format;
+  const confidence = pos.confidence;
+  const lossOdds = 100 - ourProb; // implied % this bet would lose
+
+  // 1. Sharp book strongly disagreed — Pinnacle is the smartest money.
+  //    If Pinnacle had us as an underdog OR materially below our prob, the
+  //    sharp book saw something we missed. Most actionable signal.
+  if (pinnacleProb != null) {
+    if (pinnacleProb < 50) {
+      return `Sharp fade: Pinnacle had this pick at ${pinnacleProb}% (underdog) — sharp book disagreed with us, we should have listened`;
+    }
+    if (pinnacleProb < ourProb - 8) {
+      return `Overrated by model: Pinnacle ${pinnacleProb}% vs our ${ourProb}% — sharp book saw it much closer than we did`;
+    }
+  }
+
+  // 2. Calibration didn't temper a hot model — raw prediction was extreme
+  //    and we didn't have enough historical calibration data to shrink it.
+  if (rawProb != null && rawProb >= 78 && Math.abs(rawProb - ourProb) < 3) {
+    return `Untempered model: raw prediction was ${rawProb}% — calibration data too sparse to shrink it to a realistic number`;
+  }
+
+  // 3. BO1 is a coinflip format no matter how strong the favorite.
+  if (format === 1) {
+    return `BO1 variance: single-map format — even a ${ourProb}% favorite loses ~${Math.round(lossOdds)}% of the time here`;
+  }
+
+  // 4. Genuinely close match — we shouldn't have placed this bet.
+  if (edge < 5 && ourProb < 65) {
+    return `Should have passed: only ${edge.toFixed(1)}% edge on a ${ourProb}% pick — too close to bet`;
+  }
+
+  // 5. Thin data going in.
+  if (confidence === "low") {
+    return `Thin history: confidence was "low" at bet time — not enough recent matches to trust the model`;
+  }
+
+  // 6. High-conviction loss is just the math. 80% means 1-in-5 loses.
+  if (ourProb >= 75) {
+    const frac = Math.max(2, Math.round(100 / lossOdds));
+    return `Variance loss: ${ourProb}% pick still loses 1-in-${frac}; the math always catches up eventually`;
+  }
+  if (ourProb >= 65) {
+    return `Expected variance: ${ourProb}% pick carries a ${Math.round(lossOdds)}% base loss rate — this was in that band`;
+  }
+
+  // 7. Marginal fav where market was closer to right than we were.
+  return `Marginal call: we had ${ourProb}%, market had ${marketProb}% — market was closer to reality`;
+}
+
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
 
 // Shrink a model probability toward empirical win rate in its calibration bin.
@@ -1049,15 +1113,10 @@ async function runBot() {
 
         if (won) state.bankroll += pos.betSize + pnl;
 
-        // Loss analysis — figure out WHY we lost
-        let lossReason = "";
-        if (!won) {
-          if (pos.confidence === "low") lossReason = "Low confidence pick — insufficient data";
-          else if (pos.format === 1) lossReason = "BO1 upset — high variance format";
-          else if (pos.ourProb < 60) lossReason = "Marginal edge — model wasn't confident enough";
-          else if (pos.edge < 5) lossReason = "Thin edge — market was close to correct";
-          else lossReason = "Model overestimated — market was right";
-        }
+        // Loss analysis — figure out WHY we lost. Uses all 3 probability
+        // sources (model, Polymarket, Pinnacle) + calibration data to tell a
+        // real story instead of tautologies like "model was wrong."
+        const lossReason = won ? null : diagnoseLoss(pos);
 
         const closed = {
           ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString(),
