@@ -146,16 +146,23 @@ const LOCK_PATH = join(__dirname, "run.lock");
 const LOCK_STALE_MS = 5 * 60 * 1000;
 
 function acquireRunLock() {
-  try {
-    if (existsSync(LOCK_PATH)) {
+  // Clean up stale lock first
+  if (existsSync(LOCK_PATH)) {
+    try {
       const age = Date.now() - statSync(LOCK_PATH).mtimeMs;
-      if (age < LOCK_STALE_MS) return false; // held by another run
-      console.log(`⚠️ Stale run lock (${Math.round(age / 1000)}s old), clearing.`);
-      try { unlinkSync(LOCK_PATH); } catch {}
-    }
-    writeFileSync(LOCK_PATH, String(process.pid));
+      if (age >= LOCK_STALE_MS) {
+        console.log(`⚠️ Stale run lock (${Math.round(age / 1000)}s old), clearing.`);
+        unlinkSync(LOCK_PATH);
+      }
+    } catch {}
+  }
+  // Atomic create — "wx" uses O_CREAT | O_EXCL so only one process wins.
+  // If another process already owns the lock, this throws EEXIST.
+  try {
+    writeFileSync(LOCK_PATH, String(process.pid), { flag: "wx" });
     return true;
   } catch (e) {
+    if (e.code === "EEXIST") return false;
     console.error("Lock acquire failed:", e.message);
     return false;
   }
@@ -979,6 +986,7 @@ async function runBot() {
     });
     const stillOpen = [];
     let resolvedCount = 0;
+    const resolvedForTG = []; // collect all resolutions for a single summary TG
 
     // Build a set of already-resolved position IDs for O(1) idempotency check.
     // Defends against a race where two processes both see the position as open
@@ -1053,13 +1061,34 @@ async function runBot() {
 
         const emoji = won ? "✅" : "❌";
         push(`${emoji} Resolved: ${pos.pick} (${pos.event}) → ${result} | P&L: $${pnl.toFixed(2)}${lossReason ? ` | ${lossReason}` : ""}`);
-        const lossLine = lossReason ? `\n📝 <i>${lossReason}</i>` : "";
-        await sendTG(`${emoji} <b>BET RESOLVED</b>\n\n${pos.event}\nPick: <b>${pos.pick}</b>\nResult: <b>${result.toUpperCase()}</b>\nP&L: <b>$${pnl.toFixed(2)}</b>\nBankroll: <b>$${state.bankroll.toFixed(2)}</b>${lossLine}`);
+        // Collect for a single summary Telegram at end of run (avoids spam
+        // when multiple matches finish in the same scan window).
+        resolvedForTG.push({ emoji, pos, result, pnl, lossReason });
       } else {
         stillOpen.push(pos);
       }
     }
     state.openPositions = stillOpen;
+
+    // Send ONE summary Telegram for all resolutions this run. Much better UX
+    // than spamming N messages when a BO3 tournament day has 5 matches finish
+    // at once, and dramatically limits the damage if a concurrency bug ever
+    // slips past the locks (one dupe summary instead of N dupe messages).
+    if (resolvedForTG.length > 0) {
+      const wins = resolvedForTG.filter(r => r.result === "win").length;
+      const losses = resolvedForTG.length - wins;
+      const totalPnl = resolvedForTG.reduce((s, r) => s + r.pnl, 0);
+      const headerEmoji = totalPnl >= 0 ? "📈" : "📉";
+      const pnlSign = totalPnl >= 0 ? "+" : "";
+      let msg = `${headerEmoji} <b>${resolvedForTG.length} BET${resolvedForTG.length === 1 ? "" : "S"} RESOLVED</b> — ${wins}W/${losses}L · ${pnlSign}$${totalPnl.toFixed(2)}\n`;
+      msg += `Bankroll: <b>$${state.bankroll.toFixed(2)}</b>\n`;
+      for (const r of resolvedForTG) {
+        const pnlStr = r.pnl >= 0 ? `+$${r.pnl.toFixed(2)}` : `-$${Math.abs(r.pnl).toFixed(2)}`;
+        msg += `\n${r.emoji} <b>${r.pos.pick}</b> (${r.pos.event}) ${pnlStr}`;
+        if (r.lossReason) msg += `\n   <i>${r.lossReason}</i>`;
+      }
+      await sendTG(msg);
+    }
 
     if (resolvedCount > 0 && state.closedPositions.length >= 4) {
       const newWeights = adjustWeights(state);

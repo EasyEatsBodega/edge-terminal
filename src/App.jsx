@@ -400,7 +400,8 @@ export default function App() {
     setBotError(null);
     try {
       const url = buildBotUrl("state");
-      const r = await fetch(url);
+      // Bypass browser cache — state changes frequently
+      const r = await fetch(url, { cache: "no-store" });
       if (!r.ok) {
         let detail = "";
         try {
@@ -421,7 +422,7 @@ export default function App() {
     if (!botSecret || !botUrl) return;
     setBotRunning(true);
     try {
-      const r = await fetch(buildBotUrl("run"));
+      const r = await fetch(buildBotUrl("run"), { cache: "no-store" });
       const data = await r.json();
       if (data.ok) await loadBotState();
       return data;
