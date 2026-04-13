@@ -662,6 +662,22 @@ function getDrawdownState(state) {
 
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
 
+// Shrink a model probability toward empirical win rate in its calibration bin.
+// Fixes "model overestimated" loss mode: if 70-75% bin has historically only
+// hit 58%, pull our prob down toward 58% before computing edge. Shrinkage
+// weight grows with sample size and is capped at 0.7 so we never fully discard
+// the model signal.
+function calibrateProb(modelProb, calibration) {
+  if (!calibration || !calibration.bins) return modelProb;
+  const lo = Math.floor(modelProb / 5) * 5;
+  const binKey = `${lo}-${lo + 5}`;
+  const bin = calibration.bins[binKey];
+  if (!bin || bin.total < 5) return modelProb; // not enough samples — trust model
+  const empirical = (bin.wins / bin.total) * 100;
+  const w = Math.min(0.7, bin.total / 30); // sample-size weight, capped
+  return +(modelProb * (1 - w) + empirical * w).toFixed(1);
+}
+
 function calcBetSize(edge, bankroll, confidence, format = 3, drawdownMult = 1.0) {
   // Quarter-Kelly base — conservative fractional Kelly
   const kellyFull = edge / 100 * bankroll;
@@ -1094,11 +1110,12 @@ async function runBot() {
           }
 
           const pickSide = pred.probA >= pred.probB ? "A" : "B";
-          const ourProb = pickSide === "A" ? pred.probA : pred.probB;
+          const rawProb = pickSide === "A" ? pred.probA : pred.probB;
+          const ourProb = calibrateProb(rawProb, state.calibration);
           const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
           const edge = ourProb - marketProb;
 
-          allPredictions.push({ opp, pred, pickSide, ourProb, marketProb, edge });
+          allPredictions.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, edge });
 
           // Edge bet filters — only if circuit breaker is NOT active
           if (circuitBroken) { edgeRejects.circuitBroken++; continue; }
@@ -1179,6 +1196,7 @@ async function runBot() {
           teamBId: a.opp.t2.id,
           pick, pickSide: a.pickSide,
           ourProb: +a.ourProb.toFixed(1),
+          rawProb: +a.rawProb.toFixed(1),
           marketProb: +a.marketProb.toFixed(1),
           edge: +a.edge.toFixed(1),
           betSize,
@@ -1201,7 +1219,8 @@ async function runBot() {
         state.bankroll -= betSize;
         betsPlaced.push(position);
 
-        push(`💰 BET PLACED: ${pick} in ${position.event} | Model: ${position.ourProb}% | Market: ${position.marketProb}% | Edge: +${position.edge}% | Size: $${betSize} | Liq: $${position.polyLiquidity.toFixed(0)}`);
+        const calibNote = position.rawProb && Math.abs(position.rawProb - position.ourProb) >= 1 ? ` (raw ${position.rawProb}% → cal ${position.ourProb}%)` : "";
+        push(`💰 BET PLACED: ${pick} in ${position.event} | Model: ${position.ourProb}%${calibNote} | Market: ${position.marketProb}% | Edge: +${position.edge}% | Size: $${betSize} | Liq: $${position.polyLiquidity.toFixed(0)}`);
 
         const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
 
@@ -1268,7 +1287,8 @@ async function runBot() {
           // The thesis is "ride the market consensus" — so we bet whichever side the market favors.
           const marketFavSide = ap.opp.polyOdds.probA >= ap.opp.polyOdds.probB ? "A" : "B";
           const marketFavProb = marketFavSide === "A" ? ap.opp.polyOdds.probA : ap.opp.polyOdds.probB;
-          const ourProbForFav = marketFavSide === "A" ? ap.pred.probA : ap.pred.probB;
+          const rawProbForFav = marketFavSide === "A" ? ap.pred.probA : ap.pred.probB;
+          const ourProbForFav = calibrateProb(rawProbForFav, state.calibration);
 
           // SANITY CHECK: if the two market probs don't roughly sum to 100%, the market
           // matcher found a weird prop market (like "will team win 2-0?"). Skip it.
@@ -1419,7 +1439,8 @@ async function runBot() {
           if (fadeSize > state.bankroll - currentDeployed) continue;
 
           const pick = prematchFavSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
-          const ourProb = prematchFavSide === "A" ? ap.pred.probA : ap.pred.probB;
+          const rawProb = prematchFavSide === "A" ? ap.pred.probA : ap.pred.probB;
+          const ourProb = calibrateProb(rawProb, state.calibration);
 
           const position = {
             id: `fade_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
