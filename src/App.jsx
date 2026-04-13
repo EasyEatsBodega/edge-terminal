@@ -1267,7 +1267,7 @@ export default function App() {
                   <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                     {open.map(p => (
                       <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-                      <div style={{ display: "grid", gridTemplateColumns: "50px 1fr 70px 70px 60px 60px 80px 32px", padding: "10px 14px", borderRadius: p.thesis ? "8px 8px 0 0" : 8, background: PAL.panel, borderLeft: `3px solid ${p.matchStatus === "live" ? PAL.red : PAL.yellow}`, alignItems: "center", gap: 8, fontSize: 13 }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "50px 1fr 64px 64px 64px 56px 56px 80px 32px", padding: "10px 14px", borderRadius: p.thesis ? "8px 8px 0 0" : 8, background: PAL.panel, borderLeft: `3px solid ${p.matchStatus === "live" ? PAL.red : PAL.yellow}`, alignItems: "center", gap: 8, fontSize: 13 }}>
                         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
                           <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
                           {p.matchStatus === "live" && <span style={{ fontSize: 8, fontWeight: 700, color: PAL.red, background: `${PAL.red}20`, padding: "1px 4px", borderRadius: 3 }}>LIVE</span>}
@@ -1282,7 +1282,13 @@ export default function App() {
                         </div>
                         <div style={{ textAlign: "center" }}>
                           <div style={{ fontSize: 12, fontWeight: 700 }}>{p.marketProb}%</div>
-                          <div style={{ fontSize: 10, color: PAL.dim }}>market</div>
+                          <div style={{ fontSize: 10, color: PAL.dim }}>PM</div>
+                        </div>
+                        <div style={{ textAlign: "center" }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: p.pinnacleProb == null ? PAL.dim : (p.pinnacleProb >= 50 ? PAL.green : PAL.red) }}>
+                            {p.pinnacleProb != null ? `${p.pinnacleProb}%` : "—"}
+                          </div>
+                          <div style={{ fontSize: 10, color: PAL.dim }}>Pin</div>
                         </div>
                         <div style={{ textAlign: "center", fontWeight: 700, color: PAL.green }}>+{p.edge}%</div>
                         <div style={{ textAlign: "center", fontWeight: 600 }}>${p.betSize}</div>
@@ -1392,12 +1398,12 @@ export default function App() {
                       {/* Day Trades */}
                       <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                         {/* Header row */}
-                        <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 32px", padding: "6px 14px", fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.05em" }}>
-                          <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>MKT</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span></span>
+                        <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 50px 50px 50px 44px 44px 58px 32px", padding: "6px 14px", fontSize: 10, color: PAL.dim, fontWeight: 600, letterSpacing: "0.05em" }}>
+                          <span>GAME</span><span>MATCH</span><span style={{ textAlign: "center" }}>MODEL</span><span style={{ textAlign: "center" }}>PM</span><span style={{ textAlign: "center" }}>PIN</span><span style={{ textAlign: "center" }}>EDGE</span><span style={{ textAlign: "center" }}>BET</span><span style={{ textAlign: "center" }}>P&L</span><span></span>
                         </div>
                         {dayTrades.map(p => (
                           <div key={p.id}>
-                            <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 55px 55px 50px 50px 60px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
+                            <div style={{ display: "grid", gridTemplateColumns: "46px 1fr 50px 50px 50px 44px 44px 58px 32px", padding: "10px 14px", borderRadius: 8, background: PAL.panel, borderLeft: `3px solid ${p.result === "win" ? PAL.green : PAL.red}`, alignItems: "center", gap: 4, fontSize: 13 }}>
                               <span style={{ fontSize: 10, fontWeight: 700, color: GAME_COLOR[p.game] || PAL.sub }}>{GAME_LABEL[p.game] || p.game}</span>
                               <div>
                                 <div style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
@@ -1408,6 +1414,9 @@ export default function App() {
                               </div>
                               <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600 }}>{p.ourProb}%</div>
                               <div style={{ textAlign: "center", fontSize: 12, color: PAL.sub }}>{p.marketProb}%</div>
+                              <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600, color: p.pinnacleProb == null ? PAL.dim : (p.pinnacleProb >= 50 ? PAL.green : PAL.red) }} title="Pinnacle sharp book">
+                                {p.pinnacleProb != null ? `${p.pinnacleProb}%` : "—"}
+                              </div>
                               <div style={{ textAlign: "center", fontSize: 12, fontWeight: 600, color: PAL.green }}>+{p.edge}%</div>
                               <div style={{ textAlign: "center", fontSize: 12 }}>${p.betSize}</div>
                               <div style={{ textAlign: "center", fontWeight: 700, color: (p.pnl || 0) >= 0 ? PAL.green : PAL.red }}>

@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
 import { getHltvRankDelta, rankDeltaToProbAdjust } from "./hltv.mjs";
 import { checkMatchRosters } from "./liquipedia.mjs";
+import { fetchPinnacleAllEsports, matchPinnacle } from "./pinnacle.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "config.json");
@@ -966,12 +967,13 @@ async function runBot() {
     const canBet = state.openPositions.length < MAX_POSITIONS && deployedPct < MAX_DEPLOYED_PCT && state.bankroll > MIN_BET;
 
     if (canBet) {
-      const [csgo, dota2, lol, valorant, polyMarkets] = await Promise.all([
+      const [csgo, dota2, lol, valorant, polyMarkets, pinData] = await Promise.all([
         pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("valorant/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
+        fetchPinnacleAllEsports().catch(() => ({ matchups: [], odds: new Map() })),
       ]);
 
       const allMatches = [
@@ -981,7 +983,7 @@ async function runBot() {
         ...valorant.map(m => ({ ...m, _game: "valorant" })),
       ];
 
-      push(`📊 Found ${allMatches.length} upcoming matches, ${polyMarkets.length} Polymarket moneyline markets`);
+      push(`📊 Found ${allMatches.length} upcoming matches, ${polyMarkets.length} Polymarket moneyline markets, ${pinData.odds?.size || 0} Pinnacle matchups`);
 
       // Compute league blacklist — leagues where we've been losing recently
       const blacklistedLeagues = getBlacklistedLeagues(state);
@@ -1022,6 +1024,13 @@ async function runBot() {
           rejections.noPolyOdds++;
           continue;
         }
+
+        // Pinnacle odds (sharp book) — optional third data point. We don't
+        // reject matches that lack Pinnacle coverage; it's a signal enhancer,
+        // not a gate. When present, it's stored on the opportunity and flows
+        // through to the position for display and analysis.
+        const pinOdds = matchPinnacle(pinData, t1.name, t2.name) ||
+                        matchPinnacle(pinData, t1.acronym || t1.name, t2.acronym || t2.name);
 
         // ─── Pre-match price capture (for FADE strategy) ───────────────
         // If this match hasn't started yet, record its current price as the
@@ -1071,7 +1080,7 @@ async function runBot() {
           continue;
         }
 
-        opportunities.push({ match: m, t1, t2, polyOdds });
+        opportunities.push({ match: m, t1, t2, polyOdds, pinOdds });
       }
 
       // Sort opportunities by time (soonest first) so we prioritize imminent action
@@ -1113,9 +1122,10 @@ async function runBot() {
           const rawProb = pickSide === "A" ? pred.probA : pred.probB;
           const ourProb = calibrateProb(rawProb, state.calibration);
           const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
+          const pinnacleProb = opp.pinOdds ? (pickSide === "A" ? opp.pinOdds.probA : opp.pinOdds.probB) : null;
           const edge = ourProb - marketProb;
 
-          allPredictions.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, edge });
+          allPredictions.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, pinnacleProb, edge });
 
           // Edge bet filters — only if circuit breaker is NOT active
           if (circuitBroken) { edgeRejects.circuitBroken++; continue; }
@@ -1198,6 +1208,7 @@ async function runBot() {
           ourProb: +a.ourProb.toFixed(1),
           rawProb: +a.rawProb.toFixed(1),
           marketProb: +a.marketProb.toFixed(1),
+          pinnacleProb: a.pinnacleProb != null ? +a.pinnacleProb.toFixed(1) : null,
           edge: +a.edge.toFixed(1),
           betSize,
           betPercent: +(betSize / state.bankroll * 100).toFixed(1),
@@ -1220,7 +1231,8 @@ async function runBot() {
         betsPlaced.push(position);
 
         const calibNote = position.rawProb && Math.abs(position.rawProb - position.ourProb) >= 1 ? ` (raw ${position.rawProb}% → cal ${position.ourProb}%)` : "";
-        push(`💰 BET PLACED: ${pick} in ${position.event} | Model: ${position.ourProb}%${calibNote} | Market: ${position.marketProb}% | Edge: +${position.edge}% | Size: $${betSize} | Liq: $${position.polyLiquidity.toFixed(0)}`);
+        const pinNote = position.pinnacleProb != null ? ` | Pinnacle: ${position.pinnacleProb}%` : "";
+        push(`💰 BET PLACED: ${pick} in ${position.event} | Model: ${position.ourProb}%${calibNote} | Market: ${position.marketProb}%${pinNote} | Edge: +${position.edge}% | Size: $${betSize} | Liq: $${position.polyLiquidity.toFixed(0)}`);
 
         const polyLink = position.polyUrl ? `\n🔗 <a href="${position.polyUrl}">View on Polymarket</a>` : "";
 
@@ -1323,6 +1335,7 @@ async function runBot() {
           const pickSide = marketFavSide;
           const ourProb = ourProbForFav;
           const marketProb = marketFavProb;
+          const pinnacleProb = opp.pinOdds ? (pickSide === "A" ? opp.pinOdds.probA : opp.pinOdds.probB) : null;
           const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
           const edge = ourProb - marketProb;
 
@@ -1337,6 +1350,7 @@ async function runBot() {
             pick, pickSide,
             ourProb: +ourProb.toFixed(1),
             marketProb: +marketProb.toFixed(1),
+            pinnacleProb: pinnacleProb != null ? +pinnacleProb.toFixed(1) : null,
             edge: +edge.toFixed(1),
             betSize: confirmSize,
             betPercent: +(confirmSize / state.bankroll * 100).toFixed(1),
@@ -1453,6 +1467,7 @@ async function runBot() {
             pick, pickSide: prematchFavSide,
             ourProb: +ourProb.toFixed(1),
             marketProb: +currentFavProb.toFixed(1),
+            pinnacleProb: opp.pinOdds ? +(prematchFavSide === "A" ? opp.pinOdds.probA : opp.pinOdds.probB).toFixed(1) : null,
             prematchProb: +prematchFavProb.toFixed(1),
             edge: +(prematchFavProb - currentFavProb).toFixed(1),
             betSize: fadeSize,
