@@ -108,6 +108,11 @@ const GAME_TUNING = {
     formWeight: 1.0,     // Standard
     minEdge: 5,          // Standard edge threshold
   },
+  r6siege: {
+    bo1Penalty: 0.30,    // R6 BO1 is extremely volatile (one round swings it)
+    formWeight: 1.0,     // Standard
+    minEdge: 5,          // Standard — R6 markets are thinner so edges are real
+  },
 };
 
 // ─── Drawdown Protection ───────────────────────────────────────────────────
@@ -1030,11 +1035,12 @@ async function runBot() {
     const canBet = state.openPositions.length < MAX_POSITIONS && deployedPct < MAX_DEPLOYED_PCT && state.bankroll > MIN_BET;
 
     if (canBet) {
-      const [csgo, dota2, lol, valorant, polyMarkets, pinData] = await Promise.all([
+      const [csgo, dota2, lol, valorant, r6siege, polyMarkets, pinData] = await Promise.all([
         pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("valorant/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("r6siege/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
         fetchPinnacleAllEsports().catch(() => ({ matchups: [], odds: new Map() })),
       ]);
@@ -1044,6 +1050,7 @@ async function runBot() {
         ...dota2.map(m => ({ ...m, _game: "dota2" })),
         ...lol.map(m => ({ ...m, _game: "lol" })),
         ...valorant.map(m => ({ ...m, _game: "valorant" })),
+        ...r6siege.map(m => ({ ...m, _game: "r6siege" })),
       ];
 
       push(`📊 Found ${allMatches.length} upcoming matches, ${polyMarkets.length} Polymarket moneyline markets, ${pinData.odds?.size || 0} Pinnacle matchups`);
@@ -1951,7 +1958,7 @@ async function handleTelegramCommand(text) {
 
     // By game
     if (Object.keys(games).length > 0) {
-      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant", r6siege: "R6" };
       msg += `🎮 <b>BY GAME</b>\n`;
       Object.entries(games).forEach(([g, d]) => {
         const label = GLABEL[g] || g;
@@ -2014,11 +2021,12 @@ async function handleTelegramCommand(text) {
     // Does NOT place any bets.
     try {
       const now = new Date();
-      const [csgo, dota2, lol, valorant, polyMarkets] = await Promise.all([
+      const [csgo, dota2, lol, valorant, r6siege, polyMarkets] = await Promise.all([
         pandaFetch("csgo/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("dota2/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("lol/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         pandaFetch("valorant/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
+        pandaFetch("r6siege/matches/upcoming?per_page=25&sort=scheduled_at").catch(() => []),
         fetchAllPolymarketEsports(),
       ]);
       const allMatches = [
@@ -2026,9 +2034,10 @@ async function handleTelegramCommand(text) {
         ...dota2.map(m => ({ ...m, _game: "dota2" })),
         ...lol.map(m => ({ ...m, _game: "lol" })),
         ...valorant.map(m => ({ ...m, _game: "valorant" })),
+        ...r6siege.map(m => ({ ...m, _game: "r6siege" })),
       ];
 
-      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant" };
+      const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant", r6siege: "R6" };
       const inWindow = [];
       for (const m of allMatches) {
         const t1 = m.opponents?.[0]?.opponent;
@@ -2183,7 +2192,7 @@ async function handleTelegramCommand(text) {
       return `   ${name}: ${d.w}W-${d.l}L (${pct}%)${pnl}`;
     };
 
-    const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL" };
+    const GLABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant", r6siege: "R6" };
     let msg = `🔍 <b>LOSS ANALYSIS</b>\n`;
     msg += `${wins.length}W - ${losses.length}L over ${closed.length} trades\n\n`;
 

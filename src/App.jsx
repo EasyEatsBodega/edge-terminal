@@ -12,9 +12,9 @@ const PAL = {
   green: "#22c55e", red: "#ef4444", yellow: "#eab308", blue: "#3b82f6",
   purple: "#a855f7", orange: "#f97316",
 };
-const GAME_COLOR = { csgo: "#f97316", dota2: "#ef4444", lol: "#3b82f6", valorant: "#a855f7" };
-const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant" };
-const GAME_SLUG = { csgo: "csgo", dota2: "dota2", lol: "lol", valorant: "valorant" };
+const GAME_COLOR = { csgo: "#f97316", dota2: "#ef4444", lol: "#3b82f6", valorant: "#a855f7", r6siege: "#10b981" };
+const GAME_LABEL = { csgo: "CS2", dota2: "Dota 2", lol: "LoL", valorant: "Valorant", r6siege: "R6" };
+const GAME_SLUG = { csgo: "csgo", dota2: "dota2", lol: "lol", valorant: "valorant", r6siege: "r6siege" };
 
 const save = (k, v) => { try { localStorage.setItem(`et2_${k}`, JSON.stringify(v)); } catch(e){} };
 const load = (k, fb) => { try { const v = localStorage.getItem(`et2_${k}`); return v ? JSON.parse(v) : fb; } catch(e){ return fb; } };
@@ -673,6 +673,8 @@ export default function App() {
             { id: "csgo", label: "CS2", color: GAME_COLOR.csgo },
             { id: "dota2", label: "Dota 2", color: GAME_COLOR.dota2 },
             { id: "lol", label: "LoL", color: GAME_COLOR.lol },
+            { id: "valorant", label: "Valorant", color: GAME_COLOR.valorant },
+            { id: "r6siege", label: "R6", color: GAME_COLOR.r6siege },
           ].map(g => (
             <button key={g.id} onClick={() => setGameFilter(g.id)} style={{
               width: "100%", padding: "7px 8px", borderRadius: 6, border: "none",
