@@ -5,7 +5,7 @@
 // Also runs a tiny HTTP server so the dashboard can read bot state.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -131,8 +131,38 @@ function loadState() {
   catch (e) { console.error("⚠️ Failed to read state.json:", e.message); return null; }
 }
 
+// Atomic save: write to .tmp then rename. Readers never see partial data.
 function saveState(state) {
-  writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  const tmp = STATE_PATH + ".tmp";
+  writeFileSync(tmp, JSON.stringify(state, null, 2));
+  renameSync(tmp, STATE_PATH);
+}
+
+// ─── Cross-Process Run Lock ────────────────────────────────────────────────
+// Prevents duplicate resolution messages when service + cron fire at the same
+// time. Also prevents HTTP /run + Telegram /run from racing each other within
+// the service. Stale locks (>5 min old) are considered abandoned and cleared.
+const LOCK_PATH = join(__dirname, "run.lock");
+const LOCK_STALE_MS = 5 * 60 * 1000;
+
+function acquireRunLock() {
+  try {
+    if (existsSync(LOCK_PATH)) {
+      const age = Date.now() - statSync(LOCK_PATH).mtimeMs;
+      if (age < LOCK_STALE_MS) return false; // held by another run
+      console.log(`⚠️ Stale run lock (${Math.round(age / 1000)}s old), clearing.`);
+      try { unlinkSync(LOCK_PATH); } catch {}
+    }
+    writeFileSync(LOCK_PATH, String(process.pid));
+    return true;
+  } catch (e) {
+    console.error("Lock acquire failed:", e.message);
+    return false;
+  }
+}
+
+function releaseRunLock() {
+  try { if (existsSync(LOCK_PATH)) unlinkSync(LOCK_PATH); } catch {}
 }
 
 function appendLog(msg) {
@@ -895,9 +925,25 @@ function getBlacklistedLeagues(state) {
 // MAIN BOT RUN
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// In-process mutex — guards against HTTP /run + Telegram /run + startup all
+// calling runBot() concurrently within the service process.
+let _runInFlight = false;
+
 async function runBot() {
   const log = [];
   const push = (msg) => { log.push(msg); console.log(msg); appendLog(msg); };
+
+  // In-process guard
+  if (_runInFlight) {
+    console.log("⏭️  Bot run already in progress (in-process), skipping.");
+    return { ok: true, log: ["Run already in progress — skipped."], skipped: true };
+  }
+  // Cross-process guard (service vs cron)
+  if (!acquireRunLock()) {
+    console.log("⏭️  Bot run locked by another process, skipping.");
+    return { ok: true, log: ["Run locked by another process — skipped."], skipped: true };
+  }
+  _runInFlight = true;
 
   try {
     push("🤖 Bot run starting...");
@@ -934,8 +980,21 @@ async function runBot() {
     const stillOpen = [];
     let resolvedCount = 0;
 
+    // Build a set of already-resolved position IDs for O(1) idempotency check.
+    // Defends against a race where two processes both see the position as open
+    // and both try to resolve it. The second will skip.
+    const resolvedIds = new Set(state.closedPositions.map(p => p.id));
+
     for (const pos of state.openPositions) {
       if (!toResolve.includes(pos)) { stillOpen.push(pos); continue; }
+
+      // Idempotency: if this position was already resolved (e.g. in a
+      // concurrent run that saved first), drop it silently — no duplicate
+      // Telegram, no double P&L accounting.
+      if (resolvedIds.has(pos.id)) {
+        push(`⏭️  ${pos.pick} (${pos.event}) already resolved — skipping duplicate.`);
+        continue;
+      }
 
       let won = null;
 
@@ -1674,6 +1733,9 @@ async function runBot() {
   } catch (e) {
     push(`❌ Fatal error: ${e.message}`);
     return { ok: false, error: e.message, log };
+  } finally {
+    _runInFlight = false;
+    releaseRunLock();
   }
 }
 
