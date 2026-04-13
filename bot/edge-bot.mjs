@@ -800,11 +800,11 @@ function getDrawdownState(state) {
 // Priority order: sharpest signal first. Pinnacle disagreement > calibration
 // overreach > format variance > thin-edge > expected variance.
 function diagnoseLoss(pos) {
-  const ourProb = pos.ourProb;
-  const marketProb = pos.marketProb;
-  const pinnacleProb = pos.pinnacleProb;
-  const edge = pos.edge;
-  const rawProb = pos.rawProb;
+  const ourProb = Number(pos.ourProb) || 50;
+  const marketProb = Number(pos.marketProb) || 50;
+  const pinnacleProb = pos.pinnacleProb != null ? Number(pos.pinnacleProb) : null;
+  const edge = Number(pos.edge) || 0;
+  const rawProb = pos.rawProb != null ? Number(pos.rawProb) : null;
   const format = pos.format;
   const confidence = pos.confidence;
   const lossOdds = 100 - ourProb; // implied % this bet would lose
@@ -1414,7 +1414,7 @@ async function runBot() {
           // Market-disagrees-hard guard — if market thinks <40%, require near-certainty
           if (marketProb < 40 && ourProb < 70) continue;
 
-          analyzed.push({ opp, pred, pickSide, ourProb, marketProb, edge });
+          analyzed.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, pinnacleProb, edge });
         } catch (e) {
           push(`⚠️ Error analyzing ${opp.t1.name} vs ${opp.t2.name}: ${e.message}`);
         }
@@ -1470,11 +1470,11 @@ async function runBot() {
           teamAId: a.opp.t1.id,
           teamBId: a.opp.t2.id,
           pick, pickSide: a.pickSide,
-          ourProb: +a.ourProb.toFixed(1),
-          rawProb: +a.rawProb.toFixed(1),
-          marketProb: +a.marketProb.toFixed(1),
-          pinnacleProb: a.pinnacleProb != null ? +a.pinnacleProb.toFixed(1) : null,
-          edge: +a.edge.toFixed(1),
+          ourProb: +Number(a.ourProb || 0).toFixed(1),
+          rawProb: a.rawProb != null ? +Number(a.rawProb).toFixed(1) : null,
+          marketProb: +Number(a.marketProb || 0).toFixed(1),
+          pinnacleProb: a.pinnacleProb != null ? +Number(a.pinnacleProb).toFixed(1) : null,
+          edge: +Number(a.edge || 0).toFixed(1),
           betSize,
           betPercent: +(betSize / state.bankroll * 100).toFixed(1),
           confidence: a.pred.confidence,

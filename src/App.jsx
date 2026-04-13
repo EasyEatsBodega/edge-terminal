@@ -24,7 +24,13 @@ const load = (k, fb) => { try { const v = localStorage.getItem(`et2_${k}`); retu
 // retroactively to existing closed positions. Keep this in sync with the bot.
 function diagnoseLoss(pos) {
   if (!pos || pos.result !== "loss") return null;
-  const { ourProb, marketProb, pinnacleProb, edge, rawProb, format, confidence } = pos;
+  const ourProb = Number(pos.ourProb) || 50;
+  const marketProb = Number(pos.marketProb) || 50;
+  const pinnacleProb = pos.pinnacleProb != null ? Number(pos.pinnacleProb) : null;
+  const edge = Number(pos.edge) || 0;
+  const rawProb = pos.rawProb != null ? Number(pos.rawProb) : null;
+  const format = pos.format;
+  const confidence = pos.confidence;
   const lossOdds = 100 - ourProb;
 
   if (pinnacleProb != null) {
@@ -42,7 +48,7 @@ function diagnoseLoss(pos) {
     return `BO1 variance: single-map format — even a ${ourProb}% favorite loses ~${Math.round(lossOdds)}% of the time`;
   }
   if (edge < 5 && ourProb < 65) {
-    return `Should have passed: only ${edge?.toFixed ? edge.toFixed(1) : edge}% edge on a ${ourProb}% pick`;
+    return `Should have passed: only ${edge.toFixed(1)}% edge on a ${ourProb}% pick`;
   }
   if (confidence === "low") {
     return `Thin history: confidence was "low" at bet time — not enough recent matches`;
