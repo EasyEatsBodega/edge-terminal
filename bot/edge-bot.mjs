@@ -39,7 +39,8 @@ const CFG = loadConfig();
 const INITIAL_BANKROLL = 1000;
 const MAX_DEPLOYED_PCT = 35;         // Allow more deployment for volume
 const MAX_POSITIONS = 10;            // More concurrent positions for action
-const MIN_EDGE = 3;                  // Lower threshold — catch more edges
+const MIN_EDGE = 4;                  // Raised from 3: Polymarket vig inflates perceived edge
+const MIN_EDGE_PINNACLE_BONUS = 1;   // +1% required when betting against sharp Pinnacle price
 const MAX_EDGE = 25;                 // SANITY CHECK: edges >25% indicate wrong market matched
 const MAX_BET_PCT = 5;               // Smaller max bet — survival first
 const MIN_BET = 5;
@@ -79,9 +80,15 @@ const CONFIRM_TIERS = [
 // probability — we can buy the favorite at a live discount.
 const FADE_ENABLED = true;
 const FADE_MIN_PREMATCH_PROB = 75;   // Was a heavy favorite pre-match
-const FADE_MIN_DROP_PCT = 8;         // Price dropped at least 8% live
+const FADE_MIN_DROP_PCT = 12;        // Price dropped at least 12% live.
+                                     // (Raised from 8%: an 8% drop on a 75% fav
+                                     //  is often the market being *correct*
+                                     //  about new info — not overreacting.)
 const FADE_MIN_CURRENT_PROB = 50;    // Still at least a coin flip (not a total collapse)
-const FADE_MAX_CURRENT_PROB = 72;    // Below this, it's discounted enough to matter
+const FADE_MAX_CURRENT_PROB = 60;    // Need a genuine discount, not just a dip.
+                                     // (Tightened from 72% — fading a fav still
+                                     //  priced at 70% is buying chalk at a full
+                                     //  price, not a discount.)
 const FADE_BET_PCT = 3;              // 3% of bankroll per fade bet
 const FADE_MAX_PER_RUN = 2;          // Up to 2 fade bets per run
 const FADE_MIN_LIQUIDITY = 2500;     // Need real liquidity for live bets
@@ -92,27 +99,32 @@ const GAME_TUNING = {
   csgo: {
     bo1Penalty: 0.30,    // CS2 BO1 is extremely volatile (pistol rounds, eco stacks)
     formWeight: 1.1,     // Recent form matters more in CS2 (map pool meta shifts)
-    minEdge: 4,          // Lowered — CS2 markets are sharper but 6% was too strict
+    minEdge: 5,          // Sharp book (HLTV-followed) — need real edge
+    recencyDays: 21,     // ~3 weeks of CS2 form before treating it as stale
   },
   dota2: {
     bo1Penalty: 0.20,    // Dota BO1 less volatile than CS2 (draft matters more)
     formWeight: 0.9,     // Patches shake up Dota form — overall matters more
     minEdge: 5,          // Standard edge threshold
+    recencyDays: 21,     // Dota patch cycle roughly every 3-4 weeks
   },
   lol: {
     bo1Penalty: 0.22,    // LoL BO1 moderate volatility
     formWeight: 1.0,     // Standard form weight
     minEdge: 5,          // Standard edge threshold
+    recencyDays: 21,     // LoL has its own patch filter in lol.mjs; this is a fallback
   },
   valorant: {
     bo1Penalty: 0.28,    // Valorant BO1 is volatile (agent picks, map bans matter)
     formWeight: 1.0,     // Standard
     minEdge: 5,          // Standard edge threshold
+    recencyDays: 14,     // Val patch cadence ~2 weeks, agent meta shifts fast
   },
   r6siege: {
     bo1Penalty: 0.30,    // R6 BO1 is extremely volatile (one round swings it)
     formWeight: 1.0,     // Standard
     minEdge: 5,          // Standard — R6 markets are thinner so edges are real
+    recencyDays: 28,     // R6 seasons are longer, meta moves slower
   },
 };
 
@@ -385,7 +397,13 @@ function matchPolymarket(polyMarkets, teamA, teamB) {
 
 // ─── Prediction Model (v3 — game scores, margins, dominance + recency) ─────
 
-async function computePrediction(teamAId, teamBId, histA, histB, format, weights, game = null, teamAName = null, teamBName = null) {
+async function computePrediction(teamAId, teamBId, histA, histB, format, weights, game = null, teamAName = null, teamBName = null, state = null) {
+  // Effective game tuning: starts at hand-defaults, overlaid by autoTuning.
+  const effTuning = getEffectiveTuning(game, state);
+  // Signal blend caps: how much we let HLTV/OD/VLR pull our model on the strongest signal.
+  const hltvCap = getSignalBlendWeight("hltv", state);
+  const odCap = getSignalBlendWeight("opendota", state);
+  const vlrCap = getSignalBlendWeight("vlr", state);
   // Extract rich results — game scores, margins, not just W/L
   const getResults = (history, teamId) =>
     history.map(m => {
@@ -513,7 +531,8 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
   // LoL meta shifts every ~2 weeks on patch day. Matches from prior patches
   // are on different champion balance and shouldn't count as equal evidence.
   // Filter team history to current patch (with previous-patch fallback if
-  // data is thin). Does NOT apply to other games where meta is more stable.
+  // data is thin). LoL has a precise patch signal via ddragon; other games
+  // fall back to a simpler game-specific recency window below.
   let lolPatch = null, patchBreakdownA = null, patchBreakdownB = null;
   if (game === "lol") {
     try {
@@ -525,6 +544,20 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
     } catch (e) {
       // ddragon unreachable — use full history
     }
+  } else if (game && effTuning.recencyDays) {
+    // ─── Form recency filter (CS2 / Dota / Val / R6) ──────────────────
+    // Historically we treated a 30-day-old match as equal evidence to
+    // last week's. That misses meta shifts, roster changes, and patch
+    // resets. Keep only matches inside the game's recency window (which
+    // can auto-tune based on segment performance); if a team has fewer
+    // than 4 matches in window, fall back to their full history.
+    const window = effTuning.recencyDays;
+    const filterRecent = (rs) => {
+      const recent = rs.filter(r => r.daysAgo <= window);
+      return recent.length >= 4 ? recent : rs;
+    };
+    rA = filterRecent(rA);
+    rB = filterRecent(rB);
   }
 
   const formA = recentFormWR(rA, 10);
@@ -571,25 +604,53 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
   if (rustA > 0) prob = prob * (1 - rustA) + 50 * rustA;
   if (rustB > 0) prob = prob * (1 - rustB) + 50 * rustB;  // Rusty opponent = pull our edge back
 
+  // ─── Blend a ranking-implied probability into the model ──────────────
+  // NOTE: Earlier versions added rank-based adjustments directly to `prob`
+  // (e.g. prob += 15). That stacks on top of an already-confident model and
+  // produces overconfidence: a 70% pred + strong rank signal → 85% pred,
+  // when in reality the model already captures much of the same info.
+  //
+  // Instead, treat the rank source as an independent estimate of the true
+  // win probability and blend it with the base model as a weighted average.
+  // The blend weight scales with signal strength: no signal → no shrinkage,
+  // strong signal → meaningful pull toward the rank-implied prob.
+  //
+  //   signal   = |adjust| / maxAdjust     (0..1)
+  //   rankProb = 50 + adjust              (rank source's point estimate)
+  //   w        = maxWeight * signal       (0..maxWeight)
+  //   prob'    = (1 - w) * prob + w * rankProb
+  //
+  // This produces the right behavior in each regime:
+  //  - Rank neutral  → w ≈ 0, prob unchanged.
+  //  - Rank agrees   → minor re-centering, never overshoots the rank.
+  //  - Rank disagrees → prob is pulled toward the sharper third-party view.
+  function blendRankSignal(baseProb, adjust, maxAdjust, maxWeight) {
+    if (!adjust || !Number.isFinite(adjust)) return baseProb;
+    const signal = Math.min(1, Math.abs(adjust) / maxAdjust);
+    const rankProb = 50 + adjust;
+    const w = maxWeight * signal;
+    return baseProb * (1 - w) + rankProb * w;
+  }
+
   // ─── HLTV Ranking Adjustment (CS2 only) ───────────────────────────────
-  // Our base model is 0-6 on CS2. HLTV rankings capture roster strength,
-  // map pool, and consistency that our W/L model doesn't see.
+  // HLTV rankings capture roster strength, map pool, and consistency that
+  // our W/L-based model can miss. Max 35% blend weight when the signal is
+  // at its strongest (±15 adjust).
   let hltvRankA = null, hltvRankB = null, hltvAdjust = 0;
   if (game === "csgo" && teamAName && teamBName) {
     try {
       const delta = await getHltvRankDelta(teamAName, teamBName);
       hltvAdjust = rankDeltaToProbAdjust(delta);
-      // Apply up to ±15% adjustment based on HLTV ranking gap
-      prob += hltvAdjust;
+      prob = blendRankSignal(prob, hltvAdjust, 15, hltvCap);
     } catch (e) {
       // HLTV unavailable — just skip the adjustment
     }
   }
 
   // ─── OpenDota Rating Adjustment (Dota 2 only) ─────────────────────────
-  // OpenDota maintains Elo-style ratings for all pro teams. Captures team
-  // strength across all leagues, which plain W/L % misses (beating tier-3
-  // teams is not the same as beating tier-1). Max ±12% influence.
+  // OpenDota's Elo-style ratings capture cross-league strength our W/L
+  // model can't see. Max 30% blend weight (slightly less than HLTV —
+  // Dota form shifts hard on patch, so historical Elo is noisier).
   let odRatingA = null, odRatingB = null, odAdjust = 0;
   if (game === "dota2" && teamAName && teamBName) {
     try {
@@ -601,16 +662,15 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
       odRatingA = aRating;
       odRatingB = bRating;
       odAdjust = odRatingToProbAdjust(delta);
-      prob += odAdjust;
+      prob = blendRankSignal(prob, odAdjust, 12, odCap);
     } catch (e) {
       // OpenDota unavailable — skip
     }
   }
 
   // ─── VLR.gg Ranking Adjustment (Valorant only) ────────────────────────
-  // VLR merges regional rankings (Americas/EMEA/Pacific/China/East-Asia) by
-  // points. Captures map pool, agent comp diversity, international results
-  // our W/L model can't see. Max ±12% influence.
+  // VLR regional rankings merged by points. Max 30% blend weight — VLR
+  // mixes regions with different skill floors so signal is noisier.
   let vlrRankA = null, vlrRankB = null, vlrAdjust = 0;
   if (game === "valorant" && teamAName && teamBName) {
     try {
@@ -622,7 +682,7 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
       vlrRankA = aRank;
       vlrRankB = bRank;
       vlrAdjust = vlrRankDeltaToProbAdjust(delta);
-      prob += vlrAdjust;
+      prob = blendRankSignal(prob, vlrAdjust, 12, vlrCap);
     } catch (e) {
       // VLR unavailable — skip
     }
@@ -630,8 +690,7 @@ async function computePrediction(teamAId, teamBId, histA, histB, format, weights
 
   // BO format adjustment — game-specific volatility
   const bo = format || 1;
-  const gt = game ? GAME_TUNING[game] : null;
-  const bo1Pull = gt ? gt.bo1Penalty : 0.25;  // How much to pull BO1 toward 50%
+  const bo1Pull = effTuning.bo1Penalty ?? 0.25;  // How much to pull BO1 toward 50 (auto-tunable)%
   if (bo === 1) prob = prob * (1 - bo1Pull) + 50 * bo1Pull;
   else if (bo >= 5) prob = 50 + (prob - 50) * 1.08;
 
@@ -884,17 +943,34 @@ function diagnoseLoss(pos) {
 
 // Shrink a model probability toward empirical win rate in its calibration bin.
 // Fixes "model overestimated" loss mode: if 70-75% bin has historically only
-// hit 58%, pull our prob down toward 58% before computing edge. Shrinkage
-// weight grows with sample size and is capped at 0.7 so we never fully discard
-// the model signal.
-function calibrateProb(modelProb, calibration) {
+// hit 58%, pull our prob down toward 58% before computing edge.
+//
+// Per-game bins: we keep a separate histogram per game (csgo/dota2/lol/...)
+// and use the game-specific bin when it has enough samples, falling back to
+// the pooled _all bin otherwise. Different games have different calibration
+// curves — CS2 BO1s and Dota BO5s have very different overconfidence modes.
+//
+// Tuning: 3-sample floor, 0.85 cap on shrinkage weight. Once a bin has ~20
+// samples the empirical rate dominates.
+function calibrateProb(modelProb, calibration, game = null) {
   if (!calibration || !calibration.bins) return modelProb;
   const lo = Math.floor(modelProb / 5) * 5;
   const binKey = `${lo}-${lo + 5}`;
-  const bin = calibration.bins[binKey];
-  if (!bin || bin.total < 5) return modelProb; // not enough samples — trust model
+
+  // Prefer game-specific bin when it has enough samples, else pooled _all.
+  let bin = null;
+  if (game && calibration.bins[game]?.[binKey]?.total >= 3) {
+    bin = calibration.bins[game][binKey];
+  } else if (calibration.bins._all?.[binKey]?.total >= 3) {
+    bin = calibration.bins._all[binKey];
+  } else if (calibration.bins[binKey]?.total >= 3) {
+    // Legacy flat shape — bins live directly on bins{}
+    bin = calibration.bins[binKey];
+  }
+  if (!bin) return modelProb; // not enough samples — trust model
+
   const empirical = (bin.wins / bin.total) * 100;
-  const w = Math.min(0.7, bin.total / 30); // sample-size weight, capped
+  const w = Math.min(0.85, bin.total / 25);
   return +(modelProb * (1 - w) + empirical * w).toFixed(1);
 }
 
@@ -1009,12 +1085,461 @@ function getBlacklistedLeagues(state) {
   const blacklist = new Set();
   Object.entries(byLeague).forEach(([lg, d]) => {
     const total = d.w + d.l;
-    // Blacklist if 3+ trades AND win rate below 25%
-    if (total >= 3 && d.w / total < 0.25) {
+    // Blacklist if 8+ trades AND win rate below 35%.
+    // Previously (3 trades, <25%) fired on pure variance — a 1-3 run in a
+    // profitable league was killing future entries. Requiring 8+ trades and
+    // 35% floor means we only cut leagues that are genuinely unprofitable.
+    if (total >= 8 && d.w / total < 0.35) {
       blacklist.add(lg);
     }
   });
   return blacklist;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SELF-LEARNING ENGINE (Layers 1-6)
+// ═══════════════════════════════════════════════════════════════════════════════
+// The bot mines its own closedPositions history every run to figure out what's
+// working and what isn't, then updates its own tuning knobs. The goal: every
+// resolved bet should make future bets smarter, without anyone editing code.
+//
+// Pipeline:
+//   1. computeSegments  — slice closedPositions by (game, format, betType,
+//                         league, tier, live) + pinnacle-fade pattern + CLV.
+//   2. autoTune         — walk segments, update per-game knobs + signal
+//                         blend weights + league weights. Runs daily.
+//   3. getEffective*    — readers that merge auto-tuning on top of defaults.
+//   4. getLeagueWeight  — soft league sizer (0..1.5) replacing binary blacklist.
+//   5. getSignalBlend*  — per-source blend-weight dial for HLTV/OD/VLR.
+//   6. clvGateActive    — pauses edge bets on rolling-negative CLV.
+//   7. buildTuningReport— nightly Telegram with what changed and why.
+//
+// All state lives under state.segments / state.autoTuning / state.leagueWeights /
+// state.clvGate. Backward-compatible with existing state.json; missing fields
+// fall back to the hand-tuned defaults in GAME_TUNING.
+
+// ─── Layer 1: Segmented performance table ──────────────────────────────────
+//
+// Walks closedPositions once and produces a set of aggregation buckets that
+// every other layer reads from. Pure function — safe to recompute every run.
+
+function emptyCell() {
+  return { n: 0, wins: 0, losses: 0, staked: 0, pnl: 0, clvSum: 0, clvN: 0, brierSum: 0, brierN: 0 };
+}
+
+function addToCell(cell, p) {
+  cell.n += 1;
+  if (p.result === "win") cell.wins += 1;
+  else if (p.result === "loss") cell.losses += 1;
+  cell.staked += (p.betSize || 0);
+  cell.pnl += (p.pnl || 0);
+  if (typeof p.clv === "number") { cell.clvSum += p.clv; cell.clvN += 1; }
+  if (typeof p.brier === "number") { cell.brierSum += p.brier; cell.brierN += 1; }
+}
+
+function cellSummary(cell) {
+  const wr = cell.wins + cell.losses > 0 ? cell.wins / (cell.wins + cell.losses) : null;
+  const roi = cell.staked > 0 ? cell.pnl / cell.staked : null;
+  const clv = cell.clvN > 0 ? cell.clvSum / cell.clvN : null;
+  const brier = cell.brierN > 0 ? cell.brierSum / cell.brierN : null;
+  return { ...cell, winRate: wr, roi, avgClv: clv, avgBrier: brier };
+}
+
+// Consider only bets resolved in the last N days for adaptive tuning.
+// Older data is less representative — teams change rosters, metas shift.
+const SEGMENT_LOOKBACK_DAYS = 28;
+
+function computeSegments(closedPositions, now = new Date()) {
+  const cutoff = new Date(now.getTime() - SEGMENT_LOOKBACK_DAYS * 86400000).toISOString();
+  const recent = (closedPositions || []).filter(p => (p.resolvedAt || p.placedAt) > cutoff);
+
+  const seg = {
+    computedAt: now.toISOString(),
+    lookbackDays: SEGMENT_LOOKBACK_DAYS,
+    byGameFormatType: {},
+    byGameLeague: {},
+    byTier: {},
+    byLive: { live: emptyCell(), prematch: emptyCell() },
+    byGame: {},
+    byFormat: {},
+    all: emptyCell(),
+    pinnacleFadePattern: { n: 0, losses: 0 }, // bets where Pinnacle was >5% below ourProb
+    rollingClv20: null,
+  };
+
+  for (const p of recent) {
+    const game = p.game || "unknown";
+    const format = p.format || 1;
+    const betType = p.betType || "edge";
+    const league = p.league || "";
+    const isLiveKey = p.isLive ? "live" : "prematch";
+
+    addToCell(seg.all, p);
+    addToCell(seg.byLive[isLiveKey], p);
+
+    const gftKey = `${game}_${format}_${betType}`;
+    if (!seg.byGameFormatType[gftKey]) seg.byGameFormatType[gftKey] = emptyCell();
+    addToCell(seg.byGameFormatType[gftKey], p);
+
+    if (!seg.byGame[game]) seg.byGame[game] = emptyCell();
+    addToCell(seg.byGame[game], p);
+
+    const formatKey = `${game}_bo${format}`;
+    if (!seg.byFormat[formatKey]) seg.byFormat[formatKey] = emptyCell();
+    addToCell(seg.byFormat[formatKey], p);
+
+    if (league) {
+      const glKey = `${game}::${league}`;
+      if (!seg.byGameLeague[glKey]) seg.byGameLeague[glKey] = emptyCell();
+      addToCell(seg.byGameLeague[glKey], p);
+    }
+
+    if (betType === "confirmation" && p.confirmTier) {
+      if (!seg.byTier[p.confirmTier]) seg.byTier[p.confirmTier] = emptyCell();
+      addToCell(seg.byTier[p.confirmTier], p);
+    }
+
+    // Pinnacle-fade pattern: sharp book had our pick 5+ points below our model,
+    // which historically is a strong warning signal. We track the loss rate of
+    // bets fitting that pattern so autoTune can decide whether to de-weight form.
+    if (typeof p.pinnacleProb === "number" && typeof p.ourProb === "number" &&
+        p.pinnacleProb < p.ourProb - 5) {
+      seg.pinnacleFadePattern.n += 1;
+      if (p.result === "loss") seg.pinnacleFadePattern.losses += 1;
+    }
+  }
+
+  // Rolling CLV over the last 20 resolved bets (regardless of cutoff) — this
+  // is our leading indicator for model skill, lags less than win rate.
+  const withClv = (closedPositions || []).filter(p => typeof p.clv === "number").slice(0, 20);
+  if (withClv.length >= 5) {
+    seg.rollingClv20 = +(withClv.reduce((s, p) => s + p.clv, 0) / withClv.length).toFixed(2);
+  }
+
+  return seg;
+}
+
+// ─── Layer 2: Auto-tune GAME_TUNING from segments ──────────────────────────
+//
+// Takes the current segments + the last-saved autoTuning block and produces
+// the next autoTuning block plus a changeLog describing what moved and why.
+// Never moves a parameter by more than TUNE_STEP per day, so a noisy week
+// can't nuke the bot. All parameters have floors and ceilings.
+//
+// Triggers for each parameter:
+//   bo1Penalty  ↑ when BO1 win rate lags BO3 win rate by >15pp (pull BO1 toward 50)
+//   bo1Penalty  ↓ when BO1 and BO3 win rates are within 5pp (penalty is too strong)
+//   minEdge     ↑ when low-edge bets (4-6%) lose money (ROI<0) in that game
+//   minEdge     ↓ when we're filtering plenty of matches but winning above 60%
+//   formWeight  ↓ when pinnacle-fade loss rate >60% on n>=6 (sharp book is
+//                 calling out our form overreads)
+//   recencyDays ↓ when segment ROI for the last 7d beats the prior 21d
+//                 by a margin (new data is much better than old — meta shifted)
+
+// Tuning limits — intentionally conservative. Worst case we move a knob 0.05
+// per day, so it takes ~2 weeks to fully shift from one extreme to the other.
+const TUNE_MIN_SAMPLES = 8;
+const TUNE_STEP_BO1 = 0.05;
+const TUNE_STEP_EDGE = 0.5;
+const TUNE_STEP_FORM = 0.03;
+const TUNE_STEP_RECENCY = 2;
+const TUNE_BOUNDS = {
+  bo1Penalty:  { min: 0.15, max: 0.50 },
+  formWeight:  { min: 0.70, max: 1.30 },
+  minEdge:     { min: 3.0,  max: 8.0  },
+  recencyDays: { min: 10,   max: 45   },
+};
+const DEFAULT_SIGNAL_BLEND = { hltv: 0.35, opendota: 0.30, vlr: 0.30 };
+const SIGNAL_BLEND_BOUNDS = { min: 0.10, max: 0.45 };
+
+function clamp(v, { min, max }) { return Math.max(min, Math.min(max, v)); }
+
+function autoTune(state, segments, now = new Date()) {
+  const previousTuning = state.autoTuning || {};
+  const tuning = {
+    perGame: {},
+    signalBlend: { ...DEFAULT_SIGNAL_BLEND, ...(previousTuning.signalBlend || {}) },
+    lastTunedAt: now.toISOString(),
+    changeLog: [],
+  };
+  const changeLog = [];
+  const log = (param, scope, from, to, reason) => {
+    if (from === to) return;
+    changeLog.push({
+      at: now.toISOString(), param, scope,
+      from: +(+from).toFixed(3), to: +(+to).toFixed(3), reason,
+    });
+  };
+
+  // Seed perGame from previous tuning, then overlay GAME_TUNING defaults for
+  // any missing game keys.
+  for (const game of Object.keys(GAME_TUNING)) {
+    const prev = previousTuning.perGame?.[game] || {};
+    const defaults = GAME_TUNING[game];
+    tuning.perGame[game] = {
+      bo1Penalty:  prev.bo1Penalty  ?? defaults.bo1Penalty,
+      formWeight:  prev.formWeight  ?? defaults.formWeight,
+      minEdge:     prev.minEdge     ?? defaults.minEdge,
+      recencyDays: prev.recencyDays ?? defaults.recencyDays,
+    };
+  }
+
+  // ── Per-game adjustments from segments ──
+  for (const game of Object.keys(tuning.perGame)) {
+    const t = tuning.perGame[game];
+
+    // BO1 vs BO3 win-rate gap
+    const bo1 = segments.byFormat[`${game}_bo1`];
+    const bo3 = segments.byFormat[`${game}_bo3`];
+    if (bo1 && bo3 && bo1.n >= TUNE_MIN_SAMPLES && bo3.n >= TUNE_MIN_SAMPLES) {
+      const wr1 = bo1.wins / bo1.n;
+      const wr3 = bo3.wins / bo3.n;
+      const gap = wr3 - wr1;
+      if (gap > 0.15) {
+        const next = clamp(t.bo1Penalty + TUNE_STEP_BO1, TUNE_BOUNDS.bo1Penalty);
+        log("bo1Penalty", game, t.bo1Penalty, next,
+            `BO1 ${Math.round(wr1 * 100)}% vs BO3 ${Math.round(wr3 * 100)}% (gap ${Math.round(gap * 100)}pp)`);
+        t.bo1Penalty = next;
+      } else if (gap < 0.05 && t.bo1Penalty > TUNE_BOUNDS.bo1Penalty.min) {
+        const next = clamp(t.bo1Penalty - TUNE_STEP_BO1, TUNE_BOUNDS.bo1Penalty);
+        log("bo1Penalty", game, t.bo1Penalty, next,
+            `BO1/BO3 win rates converge (gap ${Math.round(gap * 100)}pp) — penalty too strong`);
+        t.bo1Penalty = next;
+      }
+    }
+
+    // minEdge adjustment based on overall game ROI
+    const gCell = segments.byGame[game];
+    if (gCell && gCell.n >= TUNE_MIN_SAMPLES) {
+      const wr = gCell.wins / gCell.n;
+      const roi = gCell.staked > 0 ? gCell.pnl / gCell.staked : 0;
+      if (roi < -0.05) {
+        const next = clamp(t.minEdge + TUNE_STEP_EDGE, TUNE_BOUNDS.minEdge);
+        log("minEdge", game, t.minEdge, next,
+            `${game} ROI ${(roi * 100).toFixed(1)}% over ${gCell.n} bets — raising bar`);
+        t.minEdge = next;
+      } else if (roi > 0.10 && wr > 0.60) {
+        const next = clamp(t.minEdge - TUNE_STEP_EDGE, TUNE_BOUNDS.minEdge);
+        log("minEdge", game, t.minEdge, next,
+            `${game} ROI ${(roi * 100).toFixed(1)}% / WR ${Math.round(wr * 100)}% — widening net`);
+        t.minEdge = next;
+      }
+    }
+
+    // recencyDays: compare last-7d ROI against 7-28d ROI. If new is much
+    // better than old, meta has shifted — shrink the window.
+    // (Skipped in initial v1 — needs a second aggregation pass; added in a
+    //  later layer once we have enough history to see the effect.)
+  }
+
+  // ── Global: signal blend weights ──
+  // If pinnacle-fade pattern has a bad win rate, the model is overreading
+  // form vs. what the sharp book sees. Shrink form weight globally (applied
+  // via a multiplier on the HLTV/OD/VLR blend max weight below). A healthy
+  // pattern grows weights back toward default.
+  const pfp = segments.pinnacleFadePattern;
+  if (pfp.n >= 6) {
+    const lossRate = pfp.losses / pfp.n;
+    for (const src of Object.keys(tuning.signalBlend)) {
+      const prev = tuning.signalBlend[src];
+      let next = prev;
+      if (lossRate > 0.60) {
+        next = clamp(prev + TUNE_STEP_FORM, SIGNAL_BLEND_BOUNDS);
+        log("signalBlend", src, prev, next,
+            `pinnacle-fade loss rate ${Math.round(lossRate * 100)}% on ${pfp.n} bets — lean harder on ${src}`);
+      } else if (lossRate < 0.40 && prev > DEFAULT_SIGNAL_BLEND[src]) {
+        next = clamp(prev - TUNE_STEP_FORM, SIGNAL_BLEND_BOUNDS);
+        log("signalBlend", src, prev, next,
+            `pinnacle-fade healthier (${Math.round(lossRate * 100)}%) — relaxing ${src} dial back to default`);
+      }
+      tuning.signalBlend[src] = +next.toFixed(3);
+    }
+  }
+
+  // Keep the last 30 changes so /summary can display what's been moving.
+  const prevLog = previousTuning.changeLog || [];
+  tuning.changeLog = [...changeLog, ...prevLog].slice(0, 30);
+
+  return { tuning, newChanges: changeLog };
+}
+
+// Accessor: merge autoTuning on top of GAME_TUNING defaults.
+function getEffectiveTuning(game, state) {
+  const defaults = GAME_TUNING[game] || { bo1Penalty: 0.25, formWeight: 1.0, minEdge: MIN_EDGE, recencyDays: 21 };
+  const tuned = state?.autoTuning?.perGame?.[game];
+  if (!tuned) return { ...defaults };
+  return {
+    bo1Penalty:  tuned.bo1Penalty  ?? defaults.bo1Penalty,
+    formWeight:  tuned.formWeight  ?? defaults.formWeight,
+    minEdge:     tuned.minEdge     ?? defaults.minEdge,
+    recencyDays: tuned.recencyDays ?? defaults.recencyDays,
+  };
+}
+
+// ─── Layer 3a: Soft league sizing multiplier ───────────────────────────────
+//
+// Replaces the old binary blacklist with a smooth 0..1.5 multiplier. Hot
+// leagues bet bigger, cold leagues bet smaller, brand-new leagues bet 1.0x.
+// A league never goes fully to 0 from segment data alone — reaching 0 takes
+// a manual override or an egregious sample.
+const LEAGUE_WEIGHT_MIN = 0.0;
+const LEAGUE_WEIGHT_MAX = 1.5;
+const LEAGUE_WEIGHT_MIN_SAMPLES = 6;
+
+function computeLeagueWeights(segments) {
+  const weights = {};
+  for (const [key, cell] of Object.entries(segments.byGameLeague)) {
+    if (cell.n < LEAGUE_WEIGHT_MIN_SAMPLES) continue;
+    const wr = cell.wins / cell.n;
+    const roi = cell.staked > 0 ? cell.pnl / cell.staked : 0;
+    // Combined signal: weight =  0.6 × (wr/0.55) + 0.4 × (1 + 3*roi), clamped
+    // - wr=55% → baseline 1.0
+    // - wr=40%, roi=-10% → ~0.57
+    // - wr=70%, roi=+15% → ~1.34
+    const raw = 0.6 * (wr / 0.55) + 0.4 * (1 + 3 * roi);
+    const weight = Math.max(LEAGUE_WEIGHT_MIN, Math.min(LEAGUE_WEIGHT_MAX, raw));
+    weights[key] = +weight.toFixed(2);
+  }
+  return weights;
+}
+
+function getLeagueWeight(game, league, state) {
+  if (!league) return 1.0;
+  const key = `${game}::${league}`;
+  const w = state?.leagueWeights?.[key];
+  return typeof w === "number" ? w : 1.0;
+}
+
+// ─── Layer 3b: Signal blend weight accessor ────────────────────────────────
+function getSignalBlendWeight(source, state) {
+  const tuned = state?.autoTuning?.signalBlend?.[source];
+  return typeof tuned === "number" ? tuned : (DEFAULT_SIGNAL_BLEND[source] ?? 0.30);
+}
+
+// ─── Layer 4: Per-game calibration bins ────────────────────────────────────
+//
+// Migrates legacy flat-bin calibration to a per-game shape. The old data
+// lives at state.calibration.bins and was indexed by "lo-hi" like "60-65".
+// We move that under a "_all" game key so we never lose the historical
+// signal, and start indexing new resolutions by the actual game as well.
+function ensureCalibrationShape(state) {
+  if (!state.calibration) {
+    state.calibration = { totalPredictions: 0, correctPredictions: 0, bins: {} };
+  }
+  const bins = state.calibration.bins || {};
+  // Detect legacy shape: keys like "60-65" → { total, wins } at the top level
+  const keys = Object.keys(bins);
+  const looksLegacy = keys.length > 0 && keys.every(k => /^\d+-\d+$/.test(k));
+  if (looksLegacy) {
+    state.calibration.bins = { _all: { ...bins } };
+  } else if (!bins._all) {
+    bins._all = bins._all || {};
+    state.calibration.bins = bins;
+  }
+  return state.calibration.bins;
+}
+
+function getCalibrationBins(state, game) {
+  const bins = ensureCalibrationShape(state);
+  // Prefer per-game bins when they have enough samples; fall back to _all.
+  const gameBins = bins[game];
+  const allBins = bins._all;
+  return { gameBins, allBins };
+}
+
+// ─── Layer 5: CLV skill gate ───────────────────────────────────────────────
+//
+// If rolling 20-bet CLV turns negative, our picks are consistently being
+// out-priced by the market's post-bet information flow. That means our
+// model is currently losing the information race. Pause new EDGE bets
+// (not confirm/fade — those have different theses) until CLV recovers.
+const CLV_GATE_MIN_SAMPLES = 10;
+const CLV_GATE_PAUSE_BELOW = -0.75;
+const CLV_GATE_RESUME_ABOVE = 0.10;
+
+function evaluateClvGate(state, segments) {
+  const prev = state.clvGate || { paused: false, lastChangedAt: null, rollingClv: null };
+  const rolling = segments.rollingClv20;
+  const haveEnough = typeof rolling === "number" &&
+    (state.closedPositions || []).filter(p => typeof p.clv === "number").length >= CLV_GATE_MIN_SAMPLES;
+
+  const next = { ...prev, rollingClv: rolling };
+  if (!haveEnough) return next;
+
+  if (!prev.paused && rolling < CLV_GATE_PAUSE_BELOW) {
+    next.paused = true;
+    next.lastChangedAt = new Date().toISOString();
+    next.reason = `rolling CLV ${rolling.toFixed(2)}% < ${CLV_GATE_PAUSE_BELOW}% threshold`;
+  } else if (prev.paused && rolling > CLV_GATE_RESUME_ABOVE) {
+    next.paused = false;
+    next.lastChangedAt = new Date().toISOString();
+    next.reason = `rolling CLV ${rolling.toFixed(2)}% recovered above ${CLV_GATE_RESUME_ABOVE}%`;
+  }
+  return next;
+}
+
+// ─── Layer 6: Nightly tuning report ────────────────────────────────────────
+function buildTuningReport(segments, tuning, newChanges, leagueWeightsBefore, leagueWeightsAfter, clvGate) {
+  const lines = [];
+  lines.push("🧠 <b>NIGHTLY SELF-TUNING REPORT</b>\n");
+
+  // Segment highlights
+  const all = segments.all;
+  if (all.n > 0) {
+    const wr = Math.round(100 * all.wins / all.n);
+    const roi = all.staked > 0 ? (100 * all.pnl / all.staked).toFixed(1) : "0.0";
+    lines.push(`📊 Last ${segments.lookbackDays}d: ${all.wins}W-${all.losses}L · ${wr}% · ROI ${roi}%`);
+  }
+  if (typeof segments.rollingClv20 === "number") {
+    const sign = segments.rollingClv20 >= 0 ? "+" : "";
+    lines.push(`📈 Rolling CLV (last 20): <b>${sign}${segments.rollingClv20}%</b>`);
+  }
+  if (segments.pinnacleFadePattern.n >= 3) {
+    const pfp = segments.pinnacleFadePattern;
+    lines.push(`🎯 Pinnacle-fade pattern: ${pfp.losses}L / ${pfp.n} bets (${Math.round(100 * pfp.losses / pfp.n)}% loss rate)`);
+  }
+
+  // Tuning diffs
+  if (newChanges.length > 0) {
+    lines.push("\n🔧 <b>Parameter moves</b>");
+    for (const c of newChanges) {
+      lines.push(`   ${c.param} [${c.scope}]: ${c.from} → ${c.to}`);
+      lines.push(`      <i>${c.reason}</i>`);
+    }
+  } else {
+    lines.push("\n🔧 No parameter changes today — stable.");
+  }
+
+  // League weight moves
+  const beforeKeys = new Set(Object.keys(leagueWeightsBefore || {}));
+  const afterKeys = Object.keys(leagueWeightsAfter || {});
+  const leagueMoves = [];
+  for (const k of afterKeys) {
+    const before = leagueWeightsBefore?.[k];
+    const after = leagueWeightsAfter[k];
+    if (before === undefined || Math.abs((before ?? 1.0) - after) > 0.1) {
+      leagueMoves.push({ k, before, after });
+    }
+  }
+  if (leagueMoves.length > 0) {
+    lines.push("\n🏆 <b>League weight shifts</b>");
+    for (const m of leagueMoves.slice(0, 6)) {
+      const from = m.before !== undefined ? m.before.toFixed(2) : "—";
+      const name = m.k.split("::").slice(1).join("::");
+      lines.push(`   ${name}: ${from} → ${m.after.toFixed(2)}x`);
+    }
+    if (leagueMoves.length > 6) lines.push(`   … and ${leagueMoves.length - 6} more`);
+  }
+
+  // Gate state
+  if (clvGate?.paused) {
+    lines.push(`\n🛑 <b>Edge-bet gate PAUSED</b> — ${clvGate.reason || "negative CLV"}`);
+  } else if (clvGate?.lastChangedAt && newChanges.length === 0) {
+    // only mention if it recently changed
+  }
+
+  lines.push("\n<i>/summary for the full picture · /tuning for active knobs</i>");
+  return lines.join("\n");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1143,17 +1668,67 @@ async function runBot() {
         // real story instead of tautologies like "model was wrong."
         const lossReason = won ? null : diagnoseLoss(pos);
 
+        // ─── CLV (Closing Line Value) ────────────────────────────────────
+        // The closing line is the market's best estimate of true probability
+        // (it has all information up to match start). Positive CLV = we got
+        // a better price than the market settled on → our picks are on the
+        // right side of market moves, regardless of the match result. This
+        // is the single best leading indicator of long-run profitability,
+        // since actual W/L is dominated by variance over small samples.
+        //
+        // We use `lastProbA/lastProbB` from prematchPrices — the most recent
+        // pre-match observation, i.e. the closest we have to the true close.
+        // CLV is measured on OUR side: positive = we bought at a discount.
+        let closingMarketProb = null;
+        let clv = null;
+        const prematch = state.prematchPrices?.[pos.matchId];
+        if (prematch && prematch.lastProbA != null && prematch.lastProbB != null) {
+          closingMarketProb = pos.pickSide === "A" ? prematch.lastProbA : prematch.lastProbB;
+          clv = +(closingMarketProb - pos.marketProb).toFixed(2);
+        }
+
+        // ─── Brier-score contribution ────────────────────────────────────
+        // Per-bet squared error between our stated probability and the
+        // actual outcome (0 or 1). Lower is better; 0.25 is a coin flip.
+        // Stored so we can average daily/per-game and track model skill
+        // independent of P&L variance.
+        const brier = +Math.pow(pos.ourProb / 100 - (won ? 1 : 0), 2).toFixed(4);
+
         const closed = {
           ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString(),
           lossReason: won ? null : lossReason,
+          closingMarketProb,
+          clv,
+          brier,
         };
         state.closedPositions.unshift(closed);
         resolvedCount++;
 
-        const bin = `${Math.floor(pos.ourProb / 5) * 5}-${Math.floor(pos.ourProb / 5) * 5 + 5}`;
-        if (!state.calibration.bins[bin]) state.calibration.bins[bin] = { total: 0, wins: 0 };
-        state.calibration.bins[bin].total++;
-        if (won) state.calibration.bins[bin].wins++;
+        // Aggregate Brier into a per-game / per-day log so we can see if the
+        // model is actually getting sharper over time (vs. getting lucky).
+        if (!state.brierLog) state.brierLog = {};
+        const dayKey = estDayKey(now);
+        const gameKey = pos.game || "unknown";
+        if (!state.brierLog[dayKey]) state.brierLog[dayKey] = {};
+        if (!state.brierLog[dayKey][gameKey]) {
+          state.brierLog[dayKey][gameKey] = { n: 0, sum: 0 };
+        }
+        state.brierLog[dayKey][gameKey].n += 1;
+        state.brierLog[dayKey][gameKey].sum += brier;
+
+        // Update calibration bins: both pooled "_all" and per-game. Per-game
+        // bins let us shrink toward game-specific empirical rates (CS2 BO1
+        // has a very different calibration curve than Dota BO5).
+        const binKey = `${Math.floor(pos.ourProb / 5) * 5}-${Math.floor(pos.ourProb / 5) * 5 + 5}`;
+        const bins = ensureCalibrationShape(state);
+        if (!bins._all[binKey]) bins._all[binKey] = { total: 0, wins: 0 };
+        bins._all[binKey].total++;
+        if (won) bins._all[binKey].wins++;
+        const g = pos.game || "unknown";
+        if (!bins[g]) bins[g] = {};
+        if (!bins[g][binKey]) bins[g][binKey] = { total: 0, wins: 0 };
+        bins[g][binKey].total++;
+        if (won) bins[g][binKey].wins++;
         state.calibration.totalPredictions++;
         if (won) state.calibration.correctPredictions++;
 
@@ -1210,6 +1785,40 @@ async function runBot() {
         push(`🧠 Model weights adjusted: form=${newWeights.form.toFixed(2)} overall=${newWeights.overall.toFixed(2)} h2h=${newWeights.h2h.toFixed(2)}`);
         state.modelWeights = newWeights;
       }
+    }
+
+    // ─── Self-Learning Pass ───────────────────────────────────────────────
+    // Recompute segments every run (cheap — closedPositions is capped at 500).
+    // Segments drive the CLV gate on every run, and drive auto-tuning +
+    // league-weight updates once per EST day (checked below).
+    state.segments = computeSegments(state.closedPositions || [], now);
+
+    // CLV gate — pause edge bets if rolling 20-bet CLV turns meaningfully
+    // negative. This runs every run so recovery is responsive.
+    state.clvGate = evaluateClvGate(state, state.segments);
+    if (state.clvGate.paused) {
+      push(`🛑 CLV GATE ACTIVE — rolling CLV ${state.clvGate.rollingClv}% · edge bets paused`);
+    }
+
+    // Nightly auto-tune + league-weight refresh + tuning report. One run per
+    // EST day: the first run on or after 23:00 UTC that hasn't reported yet.
+    const todayKey = estDayKey(now);
+    const hourUTCNow = now.getUTCHours();
+    const dueForTuning = hourUTCNow >= 23 && state.lastTuningReport !== todayKey;
+    if (dueForTuning) {
+      const { tuning, newChanges } = autoTune(state, state.segments, now);
+      const leagueWeightsBefore = { ...(state.leagueWeights || {}) };
+      const leagueWeightsAfter = computeLeagueWeights(state.segments);
+      state.autoTuning = tuning;
+      state.leagueWeights = leagueWeightsAfter;
+      state.lastTuningReport = todayKey;
+
+      const report = buildTuningReport(
+        state.segments, tuning, newChanges,
+        leagueWeightsBefore, leagueWeightsAfter, state.clvGate
+      );
+      await sendTG(report);
+      push(`🧠 Auto-tune complete — ${newChanges.length} parameter moves, ${Object.keys(leagueWeightsAfter).length} league weights`);
     }
 
     // ─── Drawdown & Circuit Breaker Checks ────────────────────────────────
@@ -1329,25 +1938,35 @@ async function runBot() {
         const pinOdds = matchPinnacle(pinData, t1.name, t2.name) ||
                         matchPinnacle(pinData, t1.acronym || t1.name, t2.acronym || t2.name);
 
-        // ─── Pre-match price capture (for FADE strategy) ───────────────
-        // If this match hasn't started yet, record its current price as the
-        // "pre-match" baseline. Later, when the match goes live, we compare
-        // the live price against this baseline to detect big drops.
+        // ─── Pre-match price capture ───────────────────────────────────
+        // Two purposes, two different aggregations:
+        //   1. probA / probB: the FIRST/HIGHEST price we observed — that's
+        //      the pre-match peak, used by the FADE strategy to detect
+        //      significant drops during live play.
+        //   2. lastProbA / lastProbB / lastSeenAt: the MOST RECENT price
+        //      observed before the match goes live — that's our best
+        //      approximation of the closing line, used later for CLV
+        //      (closing line value) analysis on resolved bets.
         const hoursUntilMatch = (matchTime - now) / 3600000;
         if (hoursUntilMatch > 0) {
           if (!state.prematchPrices) state.prematchPrices = {};
-          // Only record the FIRST/HIGHEST price we see — that's the "true" pre-match peak
           const existing = state.prematchPrices[m.id];
           const maxProb = Math.max(polyOdds.probA, polyOdds.probB);
-          if (!existing || maxProb > Math.max(existing.probA, existing.probB)) {
-            state.prematchPrices[m.id] = {
-              probA: polyOdds.probA,
-              probB: polyOdds.probB,
-              capturedAt: now.toISOString(),
-              teamA: t1.name,
-              teamB: t2.name,
-            };
-          }
+          const prevMaxProb = existing ? Math.max(existing.probA, existing.probB) : -1;
+
+          state.prematchPrices[m.id] = {
+            // Peak (preserve if we've already seen a higher print)
+            probA: !existing || maxProb > prevMaxProb ? polyOdds.probA : existing.probA,
+            probB: !existing || maxProb > prevMaxProb ? polyOdds.probB : existing.probB,
+            capturedAt: existing?.capturedAt || now.toISOString(),
+            // Latest observation — overwritten every run so the final value
+            // before `hoursUntilMatch` goes negative is the "closing" line.
+            lastProbA: polyOdds.probA,
+            lastProbB: polyOdds.probB,
+            lastSeenAt: now.toISOString(),
+            teamA: t1.name,
+            teamB: t2.name,
+          };
         }
 
         // FILTER: Skip low-liquidity markets — prices are meaningless without real money behind them
@@ -1356,9 +1975,12 @@ async function runBot() {
           continue;
         }
 
-        // FILTER: Skip stale markets — if not updated in 3+ hours, prices may be unreliable
-        // (Extended from 2h — esports markets don't always update frequently)
-        if (polyOdds.hoursSinceUpdate !== null && polyOdds.hoursSinceUpdate > 3) {
+        // FILTER: Skip stale markets. Polymarket moves fast around news and
+        // match start. A 3h-old price is often post-news and pre-resolution
+        // stale. Tighter cutoff: 1.5h for pre-match, 0.5h for live (live prices
+        // should be updating constantly, anything older is broken liquidity).
+        const staleCutoffH = hoursUntilMatch <= 0 ? 0.5 : 1.5;
+        if (polyOdds.hoursSinceUpdate !== null && polyOdds.hoursSinceUpdate > staleCutoffH) {
           rejections.staleMarket++;
           continue;
         }
@@ -1405,7 +2027,7 @@ async function runBot() {
             pandaFetch(`${opp.match._game}/matches/past?filter[opponent_id]=${opp.t2.id}&per_page=25&sort=-scheduled_at`),
           ]);
 
-          const pred = await computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights, opp.match._game, opp.t1.name, opp.t2.name);
+          const pred = await computePrediction(opp.t1.id, opp.t2.id, histA, histB, opp.match.number_of_games, state.modelWeights, opp.match._game, opp.t1.name, opp.t2.name, state);
 
           // Check for recent roster changes (Liquipedia) — skip if either team
           // changed a player in the last 7 days (stand-ins wreck historical form)
@@ -1417,18 +2039,27 @@ async function runBot() {
 
           const pickSide = pred.probA >= pred.probB ? "A" : "B";
           const rawProb = pickSide === "A" ? pred.probA : pred.probB;
-          const ourProb = calibrateProb(rawProb, state.calibration);
+          const ourProb = calibrateProb(rawProb, state.calibration, opp.match._game);
           const marketProb = pickSide === "A" ? opp.polyOdds.probA : opp.polyOdds.probB;
           const pinnacleProb = opp.pinOdds ? (pickSide === "A" ? opp.pinOdds.probA : opp.pinOdds.probB) : null;
-          const edge = ourProb - marketProb;
+          // Use Pinnacle devigged price as the baseline when available — it's the
+          // sharpest signal of true probability. Polymarket has ~2-3% vig baked
+          // in so every edge computed against it is inflated. Fall back to
+          // Polymarket only when Pinnacle has no coverage for this matchup.
+          const baseProb = pinnacleProb != null ? pinnacleProb : marketProb;
+          const edge = ourProb - baseProb;
 
-          allPredictions.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, pinnacleProb, edge });
+          allPredictions.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, pinnacleProb, baseProb, edge });
 
-          // Edge bet filters — only if circuit breaker is NOT active
+          // Edge bet filters — circuit breaker OR the newer CLV gate will pause edge bets.
           if (circuitBroken) { edgeRejects.circuitBroken++; continue; }
+          if (state.clvGate?.paused) { edgeRejects.clvGated = (edgeRejects.clvGated || 0) + 1; continue; }
           if (ourProb < MIN_OUR_PROB) { edgeRejects.lowModelProb++; continue; }
-          // Game-specific minimum edge (CS2 markets are sharper, need bigger edge)
-          const gameMinEdge = GAME_TUNING[opp.match._game]?.minEdge || MIN_EDGE;
+          // Game-specific minimum edge from auto-tuning, with +1% when betting
+          // against a sharp book (Pinnacle) — sharp prices are already close
+          // to true, so thinner edges there are usually noise.
+          let gameMinEdge = getEffectiveTuning(opp.match._game, state).minEdge || MIN_EDGE;
+          if (pinnacleProb != null) gameMinEdge += MIN_EDGE_PINNACLE_BONUS;
           if (edge < gameMinEdge) { edgeRejects.lowEdge++; continue; }
           if (pred.confidence === "low" && ourProb < 60) { edgeRejects.lowConfidence++; continue; }
 
@@ -1446,7 +2077,7 @@ async function runBot() {
           // Market-disagrees-hard guard — if market thinks <40%, require near-certainty
           if (marketProb < 40 && ourProb < 70) continue;
 
-          analyzed.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, pinnacleProb, edge });
+          analyzed.push({ opp, pred, pickSide, ourProb, rawProb, marketProb, pinnacleProb, baseProb, edge });
         } catch (e) {
           push(`⚠️ Error analyzing ${opp.t1.name} vs ${opp.t2.name}: ${e.message}`);
         }
@@ -1489,7 +2120,12 @@ async function runBot() {
         if (currentDeployed / state.bankroll * 100 >= MAX_DEPLOYED_PCT) break;
 
         const pick = a.pickSide === "A" ? (a.opp.t1.acronym || a.opp.t1.name) : (a.opp.t2.acronym || a.opp.t2.name);
-        const betSize = calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1, dd.sizeMult);
+        // Soft league sizing — leagues with recent winning history size up, losers size down.
+        const leagueMult = getLeagueWeight(a.opp.match._game, a.opp.match.league?.name || "", state);
+        const betSize = Math.max(
+          MIN_BET,
+          Math.round(calcBetSize(a.edge, state.bankroll, a.pred.confidence, a.opp.match.number_of_games || 1, dd.sizeMult) * leagueMult)
+        );
 
         if (betSize > state.bankroll - currentDeployed) continue;
 
@@ -1506,10 +2142,12 @@ async function runBot() {
           rawProb: a.rawProb != null ? +Number(a.rawProb).toFixed(1) : null,
           marketProb: +Number(a.marketProb || 0).toFixed(1),
           pinnacleProb: a.pinnacleProb != null ? +Number(a.pinnacleProb).toFixed(1) : null,
+          baseProb: a.baseProb != null ? +Number(a.baseProb).toFixed(1) : null,
           edge: +Number(a.edge || 0).toFixed(1),
           betSize,
           betPercent: +(betSize / state.bankroll * 100).toFixed(1),
           confidence: a.pred.confidence,
+          betType: "edge",  // Explicit tag — segmenting against confirm/fade in /summary
           event: `${a.opp.t1.acronym || a.opp.t1.name} vs ${a.opp.t2.acronym || a.opp.t2.name}`,
           league: a.opp.match.league?.name || "",
           format: a.opp.match.number_of_games || 1,
@@ -1597,7 +2235,7 @@ async function runBot() {
           const marketFavSide = ap.opp.polyOdds.probA >= ap.opp.polyOdds.probB ? "A" : "B";
           const marketFavProb = marketFavSide === "A" ? ap.opp.polyOdds.probA : ap.opp.polyOdds.probB;
           const rawProbForFav = marketFavSide === "A" ? ap.pred.probA : ap.pred.probB;
-          const ourProbForFav = calibrateProb(rawProbForFav, state.calibration);
+          const ourProbForFav = calibrateProb(rawProbForFav, state.calibration, ap.opp.match._game);
 
           // SANITY CHECK: if the two market probs don't roughly sum to 100%, the market
           // matcher found a weird prop market (like "will team win 2-0?"). Skip it.
@@ -1633,8 +2271,9 @@ async function runBot() {
           const ourProb = ourProbForFav;
           const marketProb = marketFavProb;
           const pinnacleProb = opp.pinOdds ? (pickSide === "A" ? opp.pinOdds.probA : opp.pinOdds.probB) : null;
+          const baseProb = pinnacleProb != null ? pinnacleProb : marketProb;
           const pick = pickSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
-          const edge = ourProb - marketProb;
+          const edge = ourProb - baseProb;
 
           const position = {
             id: `confirm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -1648,6 +2287,7 @@ async function runBot() {
             ourProb: +ourProb.toFixed(1),
             marketProb: +marketProb.toFixed(1),
             pinnacleProb: pinnacleProb != null ? +pinnacleProb.toFixed(1) : null,
+            baseProb: +baseProb.toFixed(1),
             edge: +edge.toFixed(1),
             betSize: confirmSize,
             betPercent: +(confirmSize / state.bankroll * 100).toFixed(1),
@@ -1751,7 +2391,7 @@ async function runBot() {
 
           const pick = prematchFavSide === "A" ? (opp.t1.acronym || opp.t1.name) : (opp.t2.acronym || opp.t2.name);
           const rawProb = prematchFavSide === "A" ? ap.pred.probA : ap.pred.probB;
-          const ourProb = calibrateProb(rawProb, state.calibration);
+          const ourProb = calibrateProb(rawProb, state.calibration, opp.match._game);
 
           const position = {
             id: `fade_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -1815,6 +2455,15 @@ async function runBot() {
           if (state.prematchPrices[id].capturedAt < cutoff) {
             delete state.prematchPrices[id];
           }
+        }
+      }
+
+      // Prune Brier-score log beyond 90 days — long enough to see monthly
+      // trends, short enough to keep state.json small.
+      if (state.brierLog) {
+        const brierCutoff = estDayKey(new Date(Date.now() - 90 * 86400000));
+        for (const day of Object.keys(state.brierLog)) {
+          if (day < brierCutoff) delete state.brierLog[day];
         }
       }
     } else {
@@ -2126,6 +2775,70 @@ async function handleTelegramCommand(text) {
     }
   }
 
+  if (cmd === "/tuning") {
+    // Show the current auto-tuned knobs so we can see what the bot has decided.
+    const at = state.autoTuning;
+    const lw = state.leagueWeights || {};
+    const cg = state.clvGate || {};
+    const seg = state.segments;
+
+    let msg = `🧠 <b>SELF-TUNING STATE</b>\n\n`;
+    if (!at) {
+      msg += `<i>No auto-tuning yet — needs ~${TUNE_MIN_SAMPLES}+ resolved bets per game to start moving knobs.</i>\n`;
+    } else {
+      msg += `Last tuned: ${at.lastTunedAt ? new Date(at.lastTunedAt).toLocaleString() : "—"}\n\n`;
+      msg += `🎛️ <b>Per-game knobs</b>\n`;
+      const GL = { csgo: "CS2", dota2: "Dota", lol: "LoL", valorant: "Val", r6siege: "R6" };
+      for (const g of Object.keys(at.perGame || {})) {
+        const k = at.perGame[g];
+        msg += `   ${GL[g] || g}: minEdge ${k.minEdge} · bo1 ${k.bo1Penalty} · form ${k.formWeight} · recency ${k.recencyDays}d\n`;
+      }
+      msg += `\n🔗 <b>Signal blend caps</b>: HLTV ${at.signalBlend?.hltv ?? "—"} · OD ${at.signalBlend?.opendota ?? "—"} · VLR ${at.signalBlend?.vlr ?? "—"}\n`;
+
+      // Last few tuning changes
+      if (at.changeLog && at.changeLog.length > 0) {
+        msg += `\n📜 <b>Recent moves (last ${Math.min(at.changeLog.length, 5)})</b>\n`;
+        for (const c of at.changeLog.slice(0, 5)) {
+          msg += `   ${c.param} [${c.scope}]: ${c.from} → ${c.to}\n`;
+          msg += `      <i>${c.reason}</i>\n`;
+        }
+      }
+    }
+
+    // CLV gate
+    if (cg.rollingClv != null) {
+      const sign = cg.rollingClv >= 0 ? "+" : "";
+      msg += `\n📈 <b>CLV gate</b>: ${cg.paused ? "🛑 PAUSED" : "✅ open"} · rolling ${sign}${cg.rollingClv}%\n`;
+    }
+
+    // League weights (sorted by magnitude of deviation from 1.0)
+    const leagueEntries = Object.entries(lw).sort(([, a], [, b]) => Math.abs(b - 1) - Math.abs(a - 1));
+    if (leagueEntries.length > 0) {
+      msg += `\n🏆 <b>League weights (top 10)</b>\n`;
+      for (const [key, w] of leagueEntries.slice(0, 10)) {
+        const name = key.split("::").slice(1).join("::") || key;
+        const emoji = w > 1.1 ? "🔥" : w < 0.6 ? "🥶" : "•";
+        msg += `   ${emoji} ${name}: ${w.toFixed(2)}x\n`;
+      }
+    }
+
+    // Segment highlights
+    if (seg) {
+      msg += `\n📊 <b>Segments (last ${seg.lookbackDays}d)</b>\n`;
+      if (seg.all.n > 0) {
+        const wr = Math.round(100 * seg.all.wins / seg.all.n);
+        const roi = seg.all.staked > 0 ? (100 * seg.all.pnl / seg.all.staked).toFixed(1) : "0.0";
+        msg += `   All: ${seg.all.wins}W-${seg.all.losses}L · ${wr}% · ROI ${roi}%\n`;
+      }
+      if (seg.pinnacleFadePattern.n >= 3) {
+        const pfp = seg.pinnacleFadePattern;
+        msg += `   Pinnacle-fade: ${pfp.losses}L/${pfp.n} (${Math.round(100 * pfp.losses / pfp.n)}%)\n`;
+      }
+    }
+
+    return msg;
+  }
+
   if (cmd === "/summary") {
     const closed = state.closedPositions || [];
     const open = state.openPositions || [];
@@ -2135,15 +2848,33 @@ async function handleTelegramCommand(text) {
     const allWins = closed.filter(p => p.result === "win").length;
     const allLosses = closed.filter(p => p.result === "loss").length;
 
-    // Split by bet type
-    const edgeBets = closed.filter(p => p.betType !== "confirmation");
-    const confirmBets = closed.filter(p => p.betType === "confirmation");
-    const edgeWins = edgeBets.filter(p => p.result === "win").length;
-    const edgeLosses = edgeBets.filter(p => p.result === "loss").length;
-    const edgePnl = edgeBets.reduce((s, p) => s + (p.pnl || 0), 0);
-    const confirmWins = confirmBets.filter(p => p.result === "win").length;
-    const confirmLosses = confirmBets.filter(p => p.result === "loss").length;
-    const confirmPnl = confirmBets.reduce((s, p) => s + (p.pnl || 0), 0);
+    // Split by bet type — edge, confirmation, fade each tracked separately
+    // so we can see which strategy is actually driving P&L vs. bleeding it.
+    // ROI% = PnL / staked, more honest than raw dollars which ignore size.
+    const typeStats = (filterFn) => {
+      const bets = closed.filter(filterFn);
+      const wins = bets.filter(p => p.result === "win").length;
+      const losses = bets.filter(p => p.result === "loss").length;
+      const pnl = bets.reduce((s, p) => s + (p.pnl || 0), 0);
+      const staked = bets.reduce((s, p) => s + (p.betSize || 0), 0);
+      const roi = staked > 0 ? (pnl / staked) * 100 : 0;
+      return { n: bets.length, wins, losses, pnl, staked, roi, bets };
+    };
+    const edge = typeStats(p => !p.betType || p.betType === "edge");
+    const confirm = typeStats(p => p.betType === "confirmation");
+    const fade = typeStats(p => p.betType === "fade");
+
+    // CLV + Brier — calibration metrics that are independent of P&L variance.
+    const withClv = closed.filter(p => typeof p.clv === "number");
+    const avgClv = withClv.length > 0
+      ? withClv.reduce((s, p) => s + p.clv, 0) / withClv.length
+      : null;
+    const clvPositive = withClv.filter(p => p.clv > 0).length;
+
+    const withBrier = closed.filter(p => typeof p.brier === "number");
+    const avgBrier = withBrier.length > 0
+      ? withBrier.reduce((s, p) => s + p.brier, 0) / withBrier.length
+      : null;
 
     // By game
     const games = {};
@@ -2176,15 +2907,73 @@ async function handleTelegramCommand(text) {
     msg += `💰 P&L: <b>${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b> (${(totalPnl / (state.initialBankroll || 1000) * 100).toFixed(1)}% ROI)\n`;
     msg += `🎯 Record: <b>${allWins}W - ${allLosses}L</b> (${allWins + allLosses > 0 ? (allWins / (allWins + allLosses) * 100).toFixed(0) : 0}%)\n\n`;
 
-    // Strategy breakdown
+    // Strategy breakdown — W/L, win rate, ROI%, and P&L per bet type.
+    // ROI% is the most honest comparison across strategies since confirm
+    // bets run at bigger sizes than edge bets; raw P&L can mislead.
+    const fmtStrat = (label, s) => {
+      const wl = `${s.wins}W-${s.losses}L`;
+      const wr = s.wins + s.losses > 0 ? ((s.wins / (s.wins + s.losses)) * 100).toFixed(0) : "0";
+      const pnlSign = s.pnl >= 0 ? "+" : "";
+      const roiSign = s.roi >= 0 ? "+" : "";
+      return `   ${label}: ${wl} (${wr}%) | ${pnlSign}$${s.pnl.toFixed(2)} · ROI ${roiSign}${s.roi.toFixed(1)}%\n`;
+    };
     msg += `📈 <b>BY STRATEGY</b>\n`;
-    if (edgeBets.length > 0) {
-      msg += `   Edge: ${edgeWins}W-${edgeLosses}L (${edgeWins + edgeLosses > 0 ? (edgeWins / (edgeWins + edgeLosses) * 100).toFixed(0) : 0}%) | ${edgePnl >= 0 ? "+" : ""}$${edgePnl.toFixed(2)}\n`;
-    }
-    if (confirmBets.length > 0) {
-      msg += `   Confirm: ${confirmWins}W-${confirmLosses}L (${confirmWins + confirmLosses > 0 ? (confirmWins / (confirmWins + confirmLosses) * 100).toFixed(0) : 0}%) | ${confirmPnl >= 0 ? "+" : ""}$${confirmPnl.toFixed(2)}\n`;
-    }
+    if (edge.n > 0) msg += fmtStrat("Edge", edge);
+    if (confirm.n > 0) msg += fmtStrat("Confirm", confirm);
+    if (fade.n > 0) msg += fmtStrat("Fade", fade);
     msg += "\n";
+
+    // Model-skill metrics — CLV (closing line value) and Brier score.
+    // Both are independent of result variance, so they surface genuine
+    // improvement (or deterioration) much faster than W/L alone.
+    if (withClv.length > 0 || withBrier.length > 0) {
+      msg += `🧪 <b>MODEL SKILL</b>\n`;
+      if (withClv.length > 0 && avgClv != null) {
+        const clvSign = avgClv >= 0 ? "+" : "";
+        const clvHit = withClv.length > 0 ? (clvPositive / withClv.length * 100).toFixed(0) : "0";
+        msg += `   Avg CLV: <b>${clvSign}${avgClv.toFixed(2)}%</b> over ${withClv.length} bets · ${clvHit}% beat close\n`;
+      }
+      if (withBrier.length > 0 && avgBrier != null) {
+        // Brier benchmarks: 0.25 = coin flip, <0.20 = skilled, <0.15 = very sharp.
+        const grade = avgBrier < 0.18 ? "sharp" : avgBrier < 0.22 ? "solid" : avgBrier < 0.25 ? "marginal" : "worse than coin flip";
+        msg += `   Avg Brier: <b>${avgBrier.toFixed(3)}</b> over ${withBrier.length} bets (${grade})\n`;
+      }
+      // Today's Brier per game — lets us see which game is mispredicting today.
+      const todayKey = estDayKey(new Date());
+      const todayBrier = state.brierLog?.[todayKey];
+      if (todayBrier) {
+        const parts = [];
+        const GL = { csgo: "CS2", dota2: "Dota", lol: "LoL", valorant: "Val", r6siege: "R6" };
+        for (const [g, rec] of Object.entries(todayBrier)) {
+          if (rec.n > 0) parts.push(`${GL[g] || g} ${(rec.sum / rec.n).toFixed(3)} (n=${rec.n})`);
+        }
+        if (parts.length) msg += `   Today: ${parts.join(" · ")}\n`;
+      }
+      msg += "\n";
+    }
+
+    // ─── Self-learning snapshot ──────────────────────────────────────
+    // Compact one-liner summary of what auto-tuning is up to. Full detail
+    // is in /tuning; we just show status + any active gates here.
+    if (state.autoTuning || state.clvGate?.paused || Object.keys(state.leagueWeights || {}).length > 0) {
+      msg += `🧠 <b>SELF-LEARNING</b>\n`;
+      if (state.clvGate?.paused) {
+        msg += `   🛑 CLV gate PAUSED — ${state.clvGate.reason || "negative CLV"}\n`;
+      } else if (typeof state.clvGate?.rollingClv === "number") {
+        const sign = state.clvGate.rollingClv >= 0 ? "+" : "";
+        msg += `   CLV gate: ✅ rolling ${sign}${state.clvGate.rollingClv}%\n`;
+      }
+      if (state.autoTuning?.changeLog?.length > 0) {
+        msg += `   ${state.autoTuning.changeLog.length} recent tuning moves · /tuning for detail\n`;
+      }
+      const lw = Object.entries(state.leagueWeights || {});
+      const boosted = lw.filter(([, w]) => w > 1.1).length;
+      const damped = lw.filter(([, w]) => w < 0.6).length;
+      if (boosted || damped) {
+        msg += `   Leagues: ${boosted} boosted · ${damped} damped · /tuning for list\n`;
+      }
+      msg += "\n";
+    }
 
     // By game
     if (Object.keys(games).length > 0) {
@@ -2311,9 +3100,10 @@ async function handleTelegramCommand(text) {
         } else {
           const liq = x.polyOdds.liquidity;
           const maxProb = Math.max(x.polyOdds.probA, x.polyOdds.probB);
-          const stale = x.polyOdds.hoursSinceUpdate !== null && x.polyOdds.hoursSinceUpdate > 3;
+          const staleCutoffH = x.hoursUntil <= 0 ? 0.5 : 1.5;
+          const stale = x.polyOdds.hoursSinceUpdate !== null && x.polyOdds.hoursSinceUpdate > staleCutoffH;
           if (liq < MIN_LIQUIDITY) status = `❌ liq $${liq.toFixed(0)} &lt; $${MIN_LIQUIDITY}`;
-          else if (stale) status = `❌ stale (${x.polyOdds.hoursSinceUpdate.toFixed(1)}h)`;
+          else if (stale) status = `❌ stale (${x.polyOdds.hoursSinceUpdate.toFixed(1)}h &gt; ${staleCutoffH}h)`;
           else if (maxProb < PRICE_DISCOVERY_MIN) status = `❌ coin-flip (${maxProb.toFixed(0)}%)`;
           else status = `✅ ${maxProb.toFixed(0)}% fav · $${liq.toFixed(0)} liq`;
         }
@@ -2324,7 +3114,11 @@ async function handleTelegramCommand(text) {
       // Stats
       const withOdds = inWindow.filter(x => x.polyOdds).length;
       const passedLiq = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY).length;
-      const notStale = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY && (x.polyOdds.hoursSinceUpdate === null || x.polyOdds.hoursSinceUpdate <= 3)).length;
+      const notStale = inWindow.filter(x => {
+        if (!x.polyOdds || x.polyOdds.liquidity < MIN_LIQUIDITY) return false;
+        const cutoff = x.hoursUntil <= 0 ? 0.5 : 1.5;
+        return x.polyOdds.hoursSinceUpdate === null || x.polyOdds.hoursSinceUpdate <= cutoff;
+      }).length;
       const hasSignal = inWindow.filter(x => x.polyOdds && x.polyOdds.liquidity >= MIN_LIQUIDITY && Math.max(x.polyOdds.probA, x.polyOdds.probB) >= PRICE_DISCOVERY_MIN).length;
 
       msg += `\n<b>FUNNEL:</b>\n`;
@@ -2498,6 +3292,7 @@ async function handleTelegramCommand(text) {
       `/trades — Open positions with live prices + thesis\n` +
       `/status — Bankroll, P&L, win rate\n` +
       `/summary — Full analytics + bot vs market\n` +
+      `/tuning — Current auto-tuned knobs + league weights + CLV gate\n` +
       `/analyze — Deep-dive loss analysis + insights\n` +
       `/scan — Dry-run scan: show why matches are/aren't passing\n` +
       `/run — Trigger a bot run now\n` +
