@@ -1632,14 +1632,20 @@ async function runBot() {
         continue;
       }
 
-      let won = null;
+      let won = null; // true = win, false = loss, "push" = draw/void (stake refunded)
 
       // Try PandaScore first
       try {
         const match = await pandaFetch(`matches/${pos.matchId}`);
-        if ((match.status === "finished" || match.status === "canceled") && match.winner) {
-          won = (pos.pickSide === "A" && match.winner.id === pos.teamAId) ||
-                (pos.pickSide === "B" && match.winner.id === pos.teamBId);
+        if (match.status === "finished" || match.status === "canceled") {
+          if (match.draw) {
+            // BO2 1-1 draw or other tied result — treat as push (stake refunded)
+            won = "push";
+            push(`🤝 Draw detected via PandaScore: ${pos.event} — voiding bet`);
+          } else if (match.winner) {
+            won = (pos.pickSide === "A" && match.winner.id === pos.teamAId) ||
+                  (pos.pickSide === "B" && match.winner.id === pos.teamBId);
+          }
         }
       } catch (e) {
         push(`⚠️ PandaScore check failed for ${pos.event}: ${e.message}`);
@@ -1650,23 +1656,31 @@ async function runBot() {
         const polyOdds = matchPolymarket(polyMarketsForResolve, pos.teamA, pos.teamB);
         if (polyOdds) {
           const pickProb = pos.pickSide === "A" ? polyOdds.probA : polyOdds.probB;
+          const otherProb = pos.pickSide === "A" ? polyOdds.probB : polyOdds.probA;
           // Market resolved: price near 100 = our pick won, near 0 = lost
+          // Both near 0 = voided/draw (no winner paid out)
           if (pickProb >= 95) won = true;
-          else if (pickProb <= 5) won = false;
+          else if (pickProb <= 5 && otherProb <= 5) {
+            won = "push"; // both sides resolved to 0 = void/draw
+            push(`🤝 Draw/void detected via Polymarket: ${pos.event} — voiding bet`);
+          } else if (pickProb <= 5) won = false;
           if (won !== null) push(`📡 Resolved via Polymarket: ${pos.event}`);
         }
       }
 
       if (won !== null) {
-        const result = won ? "win" : "loss";
-        const pnl = won ? pos.betSize * ((100 / pos.marketProb) - 1) : -pos.betSize;
+        const isPush = won === "push";
+        const result = isPush ? "push" : (won ? "win" : "loss");
+        const pnl = isPush ? 0 : (won ? pos.betSize * ((100 / pos.marketProb) - 1) : -pos.betSize);
 
-        if (won) state.bankroll += pos.betSize + pnl;
+        // Refund stake on push (draw/void); add winnings on win; nothing on loss
+        if (isPush) state.bankroll += pos.betSize;
+        else if (won) state.bankroll += pos.betSize + pnl;
 
         // Loss analysis — figure out WHY we lost. Uses all 3 probability
         // sources (model, Polymarket, Pinnacle) + calibration data to tell a
         // real story instead of tautologies like "model was wrong."
-        const lossReason = won ? null : diagnoseLoss(pos);
+        const lossReason = (!isPush && !won) ? diagnoseLoss(pos) : null;
 
         // ─── CLV (Closing Line Value) ────────────────────────────────────
         // The closing line is the market's best estimate of true probability
@@ -1692,7 +1706,8 @@ async function runBot() {
         // actual outcome (0 or 1). Lower is better; 0.25 is a coin flip.
         // Stored so we can average daily/per-game and track model skill
         // independent of P&L variance.
-        const brier = +Math.pow(pos.ourProb / 100 - (won ? 1 : 0), 2).toFixed(4);
+        // Pushes/draws are excluded — they carry no signal about model accuracy.
+        const brier = isPush ? null : +Math.pow(pos.ourProb / 100 - (won ? 1 : 0), 2).toFixed(4);
 
         const closed = {
           ...pos, result, pnl: +pnl.toFixed(2), resolvedAt: now.toISOString(),
@@ -1706,33 +1721,36 @@ async function runBot() {
 
         // Aggregate Brier into a per-game / per-day log so we can see if the
         // model is actually getting sharper over time (vs. getting lucky).
-        if (!state.brierLog) state.brierLog = {};
-        const dayKey = estDayKey(now);
-        const gameKey = pos.game || "unknown";
-        if (!state.brierLog[dayKey]) state.brierLog[dayKey] = {};
-        if (!state.brierLog[dayKey][gameKey]) {
-          state.brierLog[dayKey][gameKey] = { n: 0, sum: 0 };
+        if (!isPush) {
+          // Pushes excluded from Brier + calibration — draws carry no accuracy signal
+          if (!state.brierLog) state.brierLog = {};
+          const dayKey = estDayKey(now);
+          const gameKey = pos.game || "unknown";
+          if (!state.brierLog[dayKey]) state.brierLog[dayKey] = {};
+          if (!state.brierLog[dayKey][gameKey]) {
+            state.brierLog[dayKey][gameKey] = { n: 0, sum: 0 };
+          }
+          state.brierLog[dayKey][gameKey].n += 1;
+          state.brierLog[dayKey][gameKey].sum += brier;
+
+          // Update calibration bins: both pooled "_all" and per-game. Per-game
+          // bins let us shrink toward game-specific empirical rates (CS2 BO1
+          // has a very different calibration curve than Dota BO5).
+          const binKey = `${Math.floor(pos.ourProb / 5) * 5}-${Math.floor(pos.ourProb / 5) * 5 + 5}`;
+          const bins = ensureCalibrationShape(state);
+          if (!bins._all[binKey]) bins._all[binKey] = { total: 0, wins: 0 };
+          bins._all[binKey].total++;
+          if (won) bins._all[binKey].wins++;
+          const g = pos.game || "unknown";
+          if (!bins[g]) bins[g] = {};
+          if (!bins[g][binKey]) bins[g][binKey] = { total: 0, wins: 0 };
+          bins[g][binKey].total++;
+          if (won) bins[g][binKey].wins++;
+          state.calibration.totalPredictions++;
+          if (won) state.calibration.correctPredictions++;
         }
-        state.brierLog[dayKey][gameKey].n += 1;
-        state.brierLog[dayKey][gameKey].sum += brier;
 
-        // Update calibration bins: both pooled "_all" and per-game. Per-game
-        // bins let us shrink toward game-specific empirical rates (CS2 BO1
-        // has a very different calibration curve than Dota BO5).
-        const binKey = `${Math.floor(pos.ourProb / 5) * 5}-${Math.floor(pos.ourProb / 5) * 5 + 5}`;
-        const bins = ensureCalibrationShape(state);
-        if (!bins._all[binKey]) bins._all[binKey] = { total: 0, wins: 0 };
-        bins._all[binKey].total++;
-        if (won) bins._all[binKey].wins++;
-        const g = pos.game || "unknown";
-        if (!bins[g]) bins[g] = {};
-        if (!bins[g][binKey]) bins[g][binKey] = { total: 0, wins: 0 };
-        bins[g][binKey].total++;
-        if (won) bins[g][binKey].wins++;
-        state.calibration.totalPredictions++;
-        if (won) state.calibration.correctPredictions++;
-
-        const emoji = won ? "✅" : "❌";
+        const emoji = isPush ? "🤝" : (won ? "✅" : "❌");
         push(`${emoji} Resolved: ${pos.pick} (${pos.event}) → ${result} | P&L: $${pnl.toFixed(2)}${lossReason ? ` | ${lossReason}` : ""}`);
         // Collect for a single summary Telegram at end of run (avoids spam
         // when multiple matches finish in the same scan window).
